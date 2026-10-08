@@ -7,7 +7,7 @@ use gtk4::gdk;
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::{Button, Entry, EventControllerKey, Picture, ProgressBar, Spinner};
+use gtk4::{Button, Entry, EventControllerKey, Label, MediaFile, Picture, ProgressBar, Scale, ScrolledWindow, Spinner, Video};
 use libadwaita::prelude::*;
 use libadwaita::{
     ActionRow, Application, ApplicationWindow, HeaderBar, MessageDialog, PreferencesGroup,
@@ -50,6 +50,13 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{} B", bytes)
     }
+}
+
+fn format_time_display(seconds: f64) -> String {
+    let s = seconds.max(0.0) as u64;
+    let mins = s / 60;
+    let secs = s % 60;
+    format!("{:02}:{:02}", mins, secs)
 }
 
 fn is_supported_file(path: &Path) -> bool {
@@ -384,27 +391,127 @@ fn build_ui(app: &Application) {
     file_row.add_prefix(&file_row_icon);
     file_group.add(&file_row);
 
-    // Video Trimming Group (Hidden for images)
+    // Video Player & Trimming Group (Hidden for images)
+    let video_player = Video::builder()
+        .autoplay(false)
+        .loop_(false)
+        .height_request(220)
+        .margin_start(24)
+        .margin_end(24)
+        .margin_top(8)
+        .visible(false)
+        .build();
+
     let trim_group = PreferencesGroup::builder()
-        .title("Trim Video (Optional)")
-        .description("Leave empty to compress full video")
+        .title("Video Preview & Trim")
+        .description("Play/pause to find moments, drag the timeline, or set Start & End marks")
         .margin_start(24)
         .margin_end(24)
         .visible(false)
         .build();
 
+    let timeline_scale = Scale::with_range(gtk4::Orientation::Horizontal, 0.0, 100.0, 0.1);
+    timeline_scale.set_hexpand(true);
+    timeline_scale.set_draw_value(false);
+
+    let time_pos_label = Label::new(Some("00:00 / 00:00"));
+    time_pos_label.add_css_class("dim-label");
+
+    let timeline_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+    timeline_box.set_margin_bottom(8);
+    timeline_box.append(&timeline_scale);
+    timeline_box.append(&time_pos_label);
+    trim_group.add(&timeline_box);
+
+    let set_start_btn = Button::builder()
+        .label("Set as Start")
+        .icon_name("media-seek-backward-symbolic")
+        .css_classes(["pill", "flat"])
+        .build();
+
+    let set_end_btn = Button::builder()
+        .label("Set as End")
+        .icon_name("media-seek-forward-symbolic")
+        .css_classes(["pill", "flat"])
+        .build();
+
+    let clear_trim_btn = Button::builder()
+        .label("Reset Trim")
+        .icon_name("edit-undo-symbolic")
+        .css_classes(["pill", "flat"])
+        .build();
+
+    let trim_buttons_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    trim_buttons_box.set_halign(gtk4::Align::Center);
+    trim_buttons_box.append(&set_start_btn);
+    trim_buttons_box.append(&set_end_btn);
+    trim_buttons_box.append(&clear_trim_btn);
+    trim_group.add(&trim_buttons_box);
+
     let trim_start_entry = Entry::builder()
-        .placeholder_text("Start (sec or 00:05)")
+        .placeholder_text("Start (00:00)")
+        .hexpand(true)
         .build();
 
     let trim_end_entry = Entry::builder()
-        .placeholder_text("End (sec or 00:20)")
+        .placeholder_text("End (00:00)")
+        .hexpand(true)
         .build();
 
     let trim_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+    trim_box.set_margin_top(8);
     trim_box.append(&trim_start_entry);
     trim_box.append(&trim_end_entry);
     trim_group.add(&trim_box);
+
+    let video_duration_state: Rc<RefCell<f64>> = Rc::new(RefCell::new(0.0));
+    let is_updating_scale = Rc::new(RefCell::new(false));
+
+    // When user drags timeline slider, seek video to that position
+    {
+        let video_player = video_player.clone();
+        let is_updating_scale = is_updating_scale.clone();
+        timeline_scale.connect_value_changed(move |scale| {
+            if *is_updating_scale.borrow() {
+                return;
+            }
+            if let Some(stream) = video_player.media_stream() {
+                let target_sec = scale.value();
+                let micros = (target_sec * 1_000_000.0) as i64;
+                stream.seek(micros);
+            }
+        });
+    }
+
+    // Set as Start button
+    {
+        let timeline_scale = timeline_scale.clone();
+        let trim_start_entry = trim_start_entry.clone();
+        set_start_btn.connect_clicked(move |_| {
+            let val = timeline_scale.value();
+            trim_start_entry.set_text(&format_time_display(val));
+        });
+    }
+
+    // Set as End button
+    {
+        let timeline_scale = timeline_scale.clone();
+        let trim_end_entry = trim_end_entry.clone();
+        set_end_btn.connect_clicked(move |_| {
+            let val = timeline_scale.value();
+            trim_end_entry.set_text(&format_time_display(val));
+        });
+    }
+
+    // Clear Trim marks button
+    {
+        let trim_start_entry = trim_start_entry.clone();
+        let trim_end_entry = trim_end_entry.clone();
+        clear_trim_btn.connect_clicked(move |_| {
+            trim_start_entry.set_text("");
+            trim_end_entry.set_text("");
+        });
+    }
 
     // Actions Group
     let actions_group = PreferencesGroup::builder()
@@ -469,12 +576,19 @@ fn build_ui(app: &Application) {
     actions_group.add(&actions_box);
 
     let details_container = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    details_container.append(&video_player);
     details_container.append(&preview_picture);
     details_container.append(&file_group);
     details_container.append(&trim_group);
     details_container.append(&actions_group);
 
-    view_stack.add_titled(&details_container, Some("actions"), "Actions");
+    let scrolled_details = ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vscrollbar_policy(gtk4::PolicyType::Automatic)
+        .child(&details_container)
+        .build();
+
+    view_stack.add_titled(&scrolled_details, Some("actions"), "Actions");
     view_stack.set_visible_child_name("drop");
 
     // Layout
@@ -486,8 +600,8 @@ fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("QuickCompress")
-        .default_width(540)
-        .default_height(540)
+        .default_width(580)
+        .default_height(680)
         .content(&toast_overlay)
         .build();
 
@@ -551,6 +665,13 @@ fn build_ui(app: &Application) {
         let opt_strip_exif_btn = opt_strip_exif_btn.clone();
         let open_folder_btn = open_folder_btn.clone();
         let clear_header_btn = clear_header_btn.clone();
+        let video_player = video_player.clone();
+        let timeline_scale = timeline_scale.clone();
+        let time_pos_label = time_pos_label.clone();
+        let trim_start_entry = trim_start_entry.clone();
+        let trim_end_entry = trim_end_entry.clone();
+        let video_duration_state = video_duration_state.clone();
+        let is_updating_scale = is_updating_scale.clone();
 
         move |paths: Vec<PathBuf>| {
             let mut items = Vec::new();
@@ -600,20 +721,63 @@ fn build_ui(app: &Application) {
                     "image-x-generic-symbolic"
                 }));
 
-                // Load thumbnail if it's an image
+                // Load thumbnail if it's an image, or load video in player
                 if !first.is_video {
+                    video_player.set_media_stream(None::<&gtk4::MediaStream>);
+                    video_player.set_visible(false);
                     preview_picture.set_filename(Some(&first.path));
                     preview_picture.set_visible(true);
                     trim_group.set_visible(false);
                 } else {
                     preview_picture.set_visible(false);
                     trim_group.set_visible(true);
+                    trim_start_entry.set_text("");
+                    trim_end_entry.set_text("");
+
+                    // Probe duration with ffprobe for accurate range
+                    let probed_duration = video::probe_video_duration(&first.path).unwrap_or(0.0);
+                    *video_duration_state.borrow_mut() = probed_duration;
+
+                    let file = gio::File::for_path(&first.path);
+                    let media_file = MediaFile::for_file(&file);
+                    video_player.set_media_stream(Some(&media_file));
+                    video_player.set_visible(true);
+
+                    timeline_scale.set_range(0.0, probed_duration.max(1.0));
+                    timeline_scale.set_value(0.0);
+                    time_pos_label.set_text(&format!("00:00 / {}", format_time_display(probed_duration)));
+
+                    let time_pos_label_clone = time_pos_label.clone();
+                    let timeline_scale_clone = timeline_scale.clone();
+                    let is_updating_scale_clone = is_updating_scale.clone();
+                    let dur_clone = probed_duration;
+
+                    media_file.connect_timestamp_notify(move |stream| {
+                        let current_sec = stream.timestamp() as f64 / 1_000_000.0;
+                        let total_sec = if dur_clone > 0.0 {
+                            dur_clone
+                        } else {
+                            stream.duration() as f64 / 1_000_000.0
+                        };
+
+                        time_pos_label_clone.set_text(&format!(
+                            "{} / {}",
+                            format_time_display(current_sec),
+                            format_time_display(total_sec)
+                        ));
+
+                        *is_updating_scale_clone.borrow_mut() = true;
+                        timeline_scale_clone.set_value(current_sec);
+                        *is_updating_scale_clone.borrow_mut() = false;
+                    });
                 }
             } else {
                 file_row.set_title(&format!("{} files selected", items.len()));
                 file_row.set_subtitle(&format!("Total size: {}", format_bytes(total_size)));
                 file_row_icon.set_icon_name(Some("emblem-documents-symbolic"));
                 preview_picture.set_visible(false);
+                video_player.set_media_stream(None::<&gtk4::MediaStream>);
+                video_player.set_visible(false);
                 trim_group.set_visible(false);
             }
 
@@ -657,6 +821,7 @@ fn build_ui(app: &Application) {
         let view_stack = view_stack.clone();
         let current_files = current_files.clone();
         let preview_picture = preview_picture.clone();
+        let video_player = video_player.clone();
         let trim_group = trim_group.clone();
         let open_folder_btn = open_folder_btn.clone();
         let clear_header_btn_clone = clear_header_btn.clone();
@@ -664,6 +829,8 @@ fn build_ui(app: &Application) {
         let do_clear = move || {
             current_files.borrow_mut().clear();
             preview_picture.set_visible(false);
+            video_player.set_media_stream(None::<&gtk4::MediaStream>);
+            video_player.set_visible(false);
             trim_group.set_visible(false);
             open_folder_btn.set_visible(false);
             clear_header_btn_clone.set_visible(false);

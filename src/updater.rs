@@ -3,7 +3,6 @@ use std::env;
 use std::fs::{self, File};
 use std::io;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
 use std::process::Command;
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
