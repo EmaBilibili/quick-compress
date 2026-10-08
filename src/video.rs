@@ -1,10 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub struct VideoInfo {
-    pub duration_seconds: f64,
-}
-
 pub fn probe_video_duration(input: &Path) -> Result<f64, String> {
     let output = Command::new("ffprobe")
         .args([
@@ -36,17 +32,36 @@ pub fn compress_video_target_mb(
     input: &Path,
     output: &Path,
     target_mb: f64,
+    start_sec: Option<f64>,
+    end_sec: Option<f64>,
 ) -> Result<(), String> {
-    let duration = probe_video_duration(input).unwrap_or(0.0);
+    let full_duration = probe_video_duration(input).unwrap_or(0.0);
 
-    // If duration can be determined, calculate optimal bitrate:
-    // target_bits = target_mb * 8 * 1024 * 1024 * 0.92 (safety margin)
-    // total_bitrate = target_bits / duration
+    let start = start_sec.unwrap_or(0.0);
+    let end = end_sec.unwrap_or(full_duration);
+    let effective_duration = if end > start {
+        end - start
+    } else {
+        full_duration
+    };
+
     let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-y", "-i"]).arg(input);
+    cmd.arg("-y");
 
-    if duration > 1.0 {
-        let total_bitrate_kbps = ((target_mb * 8192.0 * 0.92) / duration).floor() as u64;
+    // Fast seek before input if trimming start
+    if start > 0.0 {
+        cmd.args(["-ss", &format!("{:.2}", start)]);
+    }
+
+    cmd.args(["-i"]).arg(input);
+
+    // End time
+    if end > start && end < full_duration {
+        cmd.args(["-to", &format!("{:.2}", end)]);
+    }
+
+    if effective_duration > 1.0 {
+        let total_bitrate_kbps = ((target_mb * 8192.0 * 0.92) / effective_duration).floor() as u64;
         let audio_bitrate_kbps = 96.min(total_bitrate_kbps.saturating_sub(64) / 4);
         let video_bitrate_kbps = total_bitrate_kbps.saturating_sub(audio_bitrate_kbps).max(100);
 
@@ -103,8 +118,13 @@ pub fn compress_video_target_mb(
     }
 }
 
-pub fn generate_output_path(input: &Path, suffix: &str, ext: &str) -> PathBuf {
-    let parent = input.parent().unwrap_or_else(|| Path::new("."));
+pub fn generate_output_path(
+    input: &Path,
+    custom_dir: Option<&Path>,
+    suffix: &str,
+    ext: &str,
+) -> PathBuf {
+    let parent = custom_dir.unwrap_or_else(|| input.parent().unwrap_or_else(|| Path::new(".")));
     let stem = input
         .file_stem()
         .and_then(|s| s.to_str())

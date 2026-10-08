@@ -133,8 +133,13 @@ pub fn resize_image(
     Ok(())
 }
 
-pub fn generate_image_output_path(input: &Path, suffix: &str, ext: &str) -> PathBuf {
-    let parent = input.parent().unwrap_or_else(|| Path::new("."));
+pub fn generate_image_output_path(
+    input: &Path,
+    custom_dir: Option<&Path>,
+    suffix: &str,
+    ext: &str,
+) -> PathBuf {
+    let parent = custom_dir.unwrap_or_else(|| input.parent().unwrap_or_else(|| Path::new(".")));
     let stem = input
         .file_stem()
         .and_then(|s| s.to_str())

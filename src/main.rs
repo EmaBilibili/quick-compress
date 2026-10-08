@@ -6,7 +6,7 @@ use gtk4::gdk;
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::{Button, EventControllerKey, Picture, ProgressBar, Spinner};
+use gtk4::{Button, Entry, EventControllerKey, Picture, ProgressBar, Spinner};
 use libadwaita::prelude::*;
 use libadwaita::{
     ActionRow, Application, ApplicationWindow, HeaderBar, MessageDialog, PreferencesGroup,
@@ -28,6 +28,11 @@ struct FileItem {
     name: String,
     size_bytes: u64,
     is_video: bool,
+}
+
+#[derive(Clone, Default)]
+struct AppConfig {
+    custom_save_dir: Option<PathBuf>,
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -77,21 +82,84 @@ fn open_folder_containing(path: &Path) {
     let _ = Command::new("xdg-open").arg(target).spawn();
 }
 
-fn show_preferences_window(parent: &ApplicationWindow) {
+fn show_preferences_window(parent: &ApplicationWindow, config: Rc<RefCell<AppConfig>>) {
     let prefs = PreferencesWindow::builder()
         .transient_for(parent)
         .modal(true)
         .title("Preferences")
-        .default_width(450)
-        .default_height(400)
+        .default_width(480)
+        .default_height(420)
         .build();
 
     let page = PreferencesPage::new();
 
+    // Destination Folder Group
+    let dest_group = PreferencesGroup::builder()
+        .title("Output Directory")
+        .description("Choose where compressed files are saved")
+        .build();
+
+    let dest_row = ActionRow::builder()
+        .title("Save Location")
+        .subtitle(
+            config
+                .borrow()
+                .custom_save_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Same folder as original file".to_string()),
+        )
+        .build();
+
+    let change_dest_btn = Button::with_label("Select Folder");
+    change_dest_btn.add_css_class("flat");
+
+    let reset_dest_btn = Button::with_label("Reset to Default");
+    reset_dest_btn.add_css_class("flat");
+
+    let btn_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    btn_box.append(&change_dest_btn);
+    btn_box.append(&reset_dest_btn);
+    dest_row.add_suffix(&btn_box);
+    dest_group.add(&dest_row);
+
+    // Folder selection dialog
+    {
+        let parent_clone = parent.clone();
+        let config_clone = config.clone();
+        let dest_row_clone = dest_row.clone();
+
+        change_dest_btn.connect_clicked(move |_| {
+            let dialog = gtk4::FileDialog::new();
+            dialog.set_title("Select Output Folder");
+
+            let config_clone = config_clone.clone();
+            let dest_row_clone = dest_row_clone.clone();
+
+            dialog.select_folder(Some(&parent_clone), gio::Cancellable::NONE, move |result| {
+                if let Ok(file) = result {
+                    if let Some(path) = file.path() {
+                        dest_row_clone.set_subtitle(&path.to_string_lossy());
+                        config_clone.borrow_mut().custom_save_dir = Some(path);
+                    }
+                }
+            });
+        });
+    }
+
+    {
+        let config_clone = config.clone();
+        let dest_row_clone = dest_row;
+        reset_dest_btn.connect_clicked(move |_| {
+            config_clone.borrow_mut().custom_save_dir = None;
+            dest_row_clone.set_subtitle("Same folder as original file");
+        });
+    }
+
     // General Group
     let general_group = PreferencesGroup::builder()
         .title("General")
-        .description("Default behavior for QuickCompress")
+        .description("App version and information")
         .build();
 
     let version_row = ActionRow::builder()
@@ -163,6 +231,7 @@ fn show_preferences_window(parent: &ApplicationWindow) {
         });
     });
 
+    page.add(&dest_group);
     page.add(&general_group);
     page.add(&updates_group);
     prefs.add(&page);
@@ -235,6 +304,8 @@ fn build_ui(app: &Application) {
     let header_bar = HeaderBar::new();
     let toast_overlay = ToastOverlay::new();
 
+    let app_config: Rc<RefCell<AppConfig>> = Rc::new(RefCell::new(AppConfig::default()));
+
     // Preferences button in header bar
     let prefs_btn = Button::builder()
         .icon_name("open-menu-symbolic")
@@ -302,6 +373,28 @@ fn build_ui(app: &Application) {
     file_row.add_prefix(&file_row_icon);
     file_group.add(&file_row);
 
+    // Video Trimming Group (Hidden for images)
+    let trim_group = PreferencesGroup::builder()
+        .title("Trim Video (Optional)")
+        .description("Leave empty to compress full video")
+        .margin_start(24)
+        .margin_end(24)
+        .visible(false)
+        .build();
+
+    let trim_start_entry = Entry::builder()
+        .placeholder_text("Start (sec or 00:05)")
+        .build();
+
+    let trim_end_entry = Entry::builder()
+        .placeholder_text("End (sec or 00:20)")
+        .build();
+
+    let trim_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+    trim_box.append(&trim_start_entry);
+    trim_box.append(&trim_end_entry);
+    trim_group.add(&trim_box);
+
     // Actions Group
     let actions_group = PreferencesGroup::builder()
         .title("Actions")
@@ -367,6 +460,7 @@ fn build_ui(app: &Application) {
     let details_container = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     details_container.append(&preview_picture);
     details_container.append(&file_group);
+    details_container.append(&trim_group);
     details_container.append(&actions_group);
 
     view_stack.add_titled(&details_container, Some("actions"), "Actions");
@@ -389,12 +483,13 @@ fn build_ui(app: &Application) {
     // Connect preferences button
     {
         let window_clone = window.clone();
+        let app_config_clone = app_config.clone();
         prefs_btn.connect_clicked(move |_| {
-            show_preferences_window(&window_clone);
+            show_preferences_window(&window_clone, app_config_clone.clone());
         });
     }
 
-    // Startup background check for updates (silent, prompts modal if new version exists)
+    // Startup background check for updates
     {
         let window_clone = window.clone();
         let (sender, receiver) = async_channel::bounded::<updater::UpdateCheckResult>(1);
@@ -434,6 +529,7 @@ fn build_ui(app: &Application) {
         let file_row_icon = file_row_icon.clone();
         let preview_picture = preview_picture.clone();
         let current_files = current_files.clone();
+        let trim_group = trim_group.clone();
         let actions_group = actions_group.clone();
         let opt_discord_btn = opt_discord_btn.clone();
         let opt_email_btn = opt_email_btn.clone();
@@ -496,14 +592,17 @@ fn build_ui(app: &Application) {
                 if !first.is_video {
                     preview_picture.set_filename(Some(&first.path));
                     preview_picture.set_visible(true);
+                    trim_group.set_visible(false);
                 } else {
                     preview_picture.set_visible(false);
+                    trim_group.set_visible(true);
                 }
             } else {
                 file_row.set_title(&format!("{} files selected", items.len()));
                 file_row.set_subtitle(&format!("Total size: {}", format_bytes(total_size)));
                 file_row_icon.set_icon_name(Some("emblem-documents-symbolic"));
                 preview_picture.set_visible(false);
+                trim_group.set_visible(false);
             }
 
             // Adapt action buttons based on file types
@@ -545,10 +644,12 @@ fn build_ui(app: &Application) {
         let view_stack = view_stack.clone();
         let current_files = current_files.clone();
         let preview_picture = preview_picture.clone();
+        let trim_group = trim_group.clone();
         let open_folder_btn = open_folder_btn.clone();
         reset_btn.connect_clicked(move |_| {
             current_files.borrow_mut().clear();
             preview_picture.set_visible(false);
+            trim_group.set_visible(false);
             open_folder_btn.set_visible(false);
             view_stack.set_visible_child_name("drop");
         });
@@ -665,10 +766,32 @@ fn build_ui(app: &Application) {
         });
     }
 
-    // Helper for async video compression (supports batch)
+    // Helper: Parse seconds from string like "12.5" or "01:23"
+    let parse_time_str = |s: &str| -> Option<f64> {
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+
+        if s.contains(':') {
+            let parts: Vec<&str> = s.split(':').collect();
+            if parts.len() == 2 {
+                let mins: f64 = parts[0].parse().ok()?;
+                let secs: f64 = parts[1].parse().ok()?;
+                return Some(mins * 60.0 + secs);
+            }
+        }
+
+        s.parse::<f64>().ok()
+    };
+
+    // Helper for async video compression (supports batch + trim)
     let trigger_video_compression = {
         let current_files = current_files.clone();
+        let app_config = app_config.clone();
         let toast_overlay = toast_overlay.clone();
+        let trim_start_entry = trim_start_entry.clone();
+        let trim_end_entry = trim_end_entry.clone();
         let opt_discord_btn = opt_discord_btn.clone();
         let opt_email_btn = opt_email_btn.clone();
         let open_folder_btn = open_folder_btn.clone();
@@ -683,6 +806,10 @@ fn build_ui(app: &Application) {
             if items.is_empty() {
                 return;
             }
+
+            let start_sec = parse_time_str(&trim_start_entry.text());
+            let end_sec = parse_time_str(&trim_end_entry.text());
+            let custom_dir = app_config.borrow().custom_save_dir.clone();
 
             opt_discord_btn.set_sensitive(false);
             opt_email_btn.set_sensitive(false);
@@ -713,9 +840,20 @@ fn build_ui(app: &Application) {
 
                 for (idx, item) in items_to_process.iter().enumerate() {
                     let out_suffix = format!("{:.0}mb", target_mb);
-                    let out_path = video::generate_output_path(&item.path, &out_suffix, "mp4");
+                    let out_path = video::generate_output_path(
+                        &item.path,
+                        custom_dir.as_deref(),
+                        &out_suffix,
+                        "mp4",
+                    );
 
-                    if let Err(e) = video::compress_video_target_mb(&item.path, &out_path, target_mb) {
+                    if let Err(e) = video::compress_video_target_mb(
+                        &item.path,
+                        &out_path,
+                        target_mb,
+                        start_sec,
+                        end_sec,
+                    ) {
                         let _ = sender.send_blocking(Err(e));
                         return;
                     }
@@ -788,9 +926,10 @@ fn build_ui(app: &Application) {
         }
     };
 
-    // Helper for async image compression (supports batch)
+    // Helper for async image compression (supports batch + custom save directory)
     let trigger_image_compression = {
         let current_files = current_files.clone();
+        let app_config = app_config.clone();
         let toast_overlay = toast_overlay.clone();
         let opt_webp_lossy_btn = opt_webp_lossy_btn.clone();
         let opt_webp_lossless_btn = opt_webp_lossless_btn.clone();
@@ -810,6 +949,8 @@ fn build_ui(app: &Application) {
             if items.is_empty() {
                 return;
             }
+
+            let custom_dir = app_config.borrow().custom_save_dir.clone();
 
             opt_webp_lossy_btn.set_sensitive(false);
             opt_webp_lossless_btn.set_sensitive(false);
@@ -855,7 +996,12 @@ fn build_ui(app: &Application) {
                         3 => ("scaled50", orig_ext),
                         _ => ("clean", orig_ext),
                     };
-                    let out_path = image_ops::generate_image_output_path(&item.path, out_suffix, ext);
+                    let out_path = image_ops::generate_image_output_path(
+                        &item.path,
+                        custom_dir.as_deref(),
+                        out_suffix,
+                        ext,
+                    );
 
                     let res = match mode {
                         0 => image_ops::convert_to_webp(&item.path, &out_path, false),
