@@ -5,22 +5,24 @@ use gtk4::gdk;
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::{Button, ProgressBar, Spinner};
+use gtk4::{Button, EventControllerKey, ProgressBar, Spinner};
 use libadwaita::prelude::*;
 use libadwaita::{
     ActionRow, Application, ApplicationWindow, HeaderBar, PreferencesGroup, StatusPage,
     Toast, ToastOverlay, ViewStack,
 };
 use std::cell::RefCell;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::rc::Rc;
 use std::thread;
 
 const APP_ID: &str = "io.github.EmaBilibili.QuickCompress";
 
 #[derive(Clone)]
-struct FileInfo {
+struct FileItem {
     path: PathBuf,
     name: String,
     size_bytes: u64,
@@ -64,6 +66,16 @@ fn is_video_file(path: &Path) -> bool {
     }
 }
 
+fn open_folder_containing(path: &Path) {
+    let target = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or_else(|| Path::new("."))
+    };
+
+    let _ = Command::new("xdg-open").arg(target).spawn();
+}
+
 fn main() {
     let app = Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_ui);
@@ -80,25 +92,36 @@ fn build_ui(app: &Application) {
     let drop_status_page = StatusPage::builder()
         .icon_name("document-send-symbolic")
         .title("QuickCompress")
-        .description("Drag and drop images, video or audio files here\nor choose a file to compress")
+        .description("Drag and drop single or multiple files here\nor paste an image from clipboard (Ctrl+V)")
         .build();
 
     let open_file_btn = Button::builder()
-        .label("Choose File…")
+        .label("Choose Files…")
         .css_classes(["pill", "suggested-action"])
         .halign(gtk4::Align::Center)
         .build();
 
+    let paste_btn = Button::builder()
+        .label("Paste from Clipboard")
+        .css_classes(["pill", "flat"])
+        .halign(gtk4::Align::Center)
+        .build();
+
+    let btn_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+    btn_box.set_halign(gtk4::Align::Center);
+    btn_box.append(&open_file_btn);
+    btn_box.append(&paste_btn);
+
     let drop_box = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
     drop_box.append(&drop_status_page);
-    drop_box.append(&open_file_btn);
+    drop_box.append(&btn_box);
     drop_box.set_valign(gtk4::Align::Center);
 
     view_stack.add_titled(&drop_box, Some("drop"), "Drop");
 
     // 2. File Selected & Compression Actions View
     let file_group = PreferencesGroup::builder()
-        .title("Selected File")
+        .title("Selected Files")
         .margin_top(16)
         .margin_bottom(16)
         .margin_start(24)
@@ -135,6 +158,15 @@ fn build_ui(app: &Application) {
     let opt_resize_50_btn = Button::with_label("Scale Down 50% (Halve Dimensions)");
     let opt_strip_exif_btn = Button::with_label("Strip EXIF & Privacy Metadata (GPS/Camera)");
 
+    // Success Actions: Open Folder Button
+    let open_folder_btn = Button::builder()
+        .label("Open Output Folder")
+        .css_classes(["flat"])
+        .icon_name("folder-open-symbolic")
+        .halign(gtk4::Align::Center)
+        .visible(false)
+        .build();
+
     // Progress bar and spinner
     let spinner = Spinner::new();
     spinner.set_halign(gtk4::Align::Center);
@@ -148,7 +180,7 @@ fn build_ui(app: &Application) {
     status_label.set_visible(false);
     status_label.add_css_class("dim-label");
 
-    let reset_btn = Button::with_label("Choose another file");
+    let reset_btn = Button::with_label("Choose other files");
     reset_btn.add_css_class("flat");
 
     let actions_box = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
@@ -162,6 +194,7 @@ fn build_ui(app: &Application) {
     actions_box.append(&spinner);
     actions_box.append(&progress_bar);
     actions_box.append(&status_label);
+    actions_box.append(&open_folder_btn);
     actions_box.append(&reset_btn);
     actions_group.add(&actions_box);
 
@@ -181,19 +214,30 @@ fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("QuickCompress")
-        .default_width(520)
-        .default_height(480)
+        .default_width(540)
+        .default_height(520)
         .content(&toast_overlay)
         .build();
 
-    let current_file: Rc<RefCell<Option<FileInfo>>> = Rc::new(RefCell::new(None));
+    let current_files: Rc<RefCell<Vec<FileItem>>> = Rc::new(RefCell::new(Vec::new()));
+    let last_output_dir: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
 
-    // Helper: update UI on file load
-    let update_file_selected = {
+    // Connect open folder button
+    {
+        let last_output_dir = last_output_dir.clone();
+        open_folder_btn.connect_clicked(move |_| {
+            if let Some(dir) = last_output_dir.borrow().as_ref() {
+                open_folder_containing(dir);
+            }
+        });
+    }
+
+    // Helper: update UI on files loaded (single or batch)
+    let update_files_selected = {
         let view_stack = view_stack.clone();
         let file_row = file_row.clone();
         let file_row_icon = file_row_icon.clone();
-        let current_file = current_file.clone();
+        let current_files = current_files.clone();
         let actions_group = actions_group.clone();
         let opt_discord_btn = opt_discord_btn.clone();
         let opt_email_btn = opt_email_btn.clone();
@@ -202,85 +246,182 @@ fn build_ui(app: &Application) {
         let opt_jpeg_chat_btn = opt_jpeg_chat_btn.clone();
         let opt_resize_50_btn = opt_resize_50_btn.clone();
         let opt_strip_exif_btn = opt_strip_exif_btn.clone();
+        let open_folder_btn = open_folder_btn.clone();
 
-        move |path: PathBuf| {
-            if let Ok(metadata) = fs::metadata(&path) {
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("Unknown")
-                    .to_string();
-                let size = metadata.len();
-                let is_video = is_video_file(&path);
+        move |paths: Vec<PathBuf>| {
+            let mut items = Vec::new();
+            let mut total_size: u64 = 0;
+            let mut has_video = false;
+            let mut has_image = false;
 
-                file_row.set_title(&name);
-                file_row.set_subtitle(&format!("Original size: {}", format_bytes(size)));
-                file_row_icon.set_icon_name(Some(if is_video {
+            for path in paths {
+                if let Ok(metadata) = fs::metadata(&path) {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("Unknown")
+                        .to_string();
+                    let size = metadata.len();
+                    let is_video = is_video_file(&path);
+
+                    if is_video {
+                        has_video = true;
+                    } else {
+                        has_image = true;
+                    }
+                    total_size += size;
+
+                    items.push(FileItem {
+                        path,
+                        name,
+                        size_bytes: size,
+                        is_video,
+                    });
+                }
+            }
+
+            if items.is_empty() {
+                return;
+            }
+
+            open_folder_btn.set_visible(false);
+
+            if items.len() == 1 {
+                let first = &items[0];
+                file_row.set_title(&first.name);
+                file_row.set_subtitle(&format!("Original size: {}", format_bytes(first.size_bytes)));
+                file_row_icon.set_icon_name(Some(if first.is_video {
                     "video-x-generic-symbolic"
                 } else {
                     "image-x-generic-symbolic"
                 }));
-
-                // Adapt action buttons based on file type
-                if is_video {
-                    actions_group.set_title("Quick Video Compression");
-                    opt_discord_btn.set_visible(true);
-                    opt_email_btn.set_visible(true);
-                    opt_webp_lossy_btn.set_visible(false);
-                    opt_webp_lossless_btn.set_visible(false);
-                    opt_jpeg_chat_btn.set_visible(false);
-                    opt_resize_50_btn.set_visible(false);
-                    opt_strip_exif_btn.set_visible(false);
-                } else {
-                    actions_group.set_title("Quick Image Actions");
-                    opt_discord_btn.set_visible(false);
-                    opt_email_btn.set_visible(false);
-                    opt_webp_lossy_btn.set_visible(true);
-                    opt_webp_lossless_btn.set_visible(true);
-                    opt_jpeg_chat_btn.set_visible(true);
-                    opt_resize_50_btn.set_visible(true);
-                    opt_strip_exif_btn.set_visible(true);
-                }
-
-                *current_file.borrow_mut() = Some(FileInfo {
-                    path,
-                    name,
-                    size_bytes: size,
-                    is_video,
-                });
-
-                view_stack.set_visible_child_name("actions");
+            } else {
+                file_row.set_title(&format!("{} files selected", items.len()));
+                file_row.set_subtitle(&format!("Total size: {}", format_bytes(total_size)));
+                file_row_icon.set_icon_name(Some("emblem-documents-symbolic"));
             }
+
+            // Adapt action buttons based on file types
+            if has_video && !has_image {
+                actions_group.set_title(if items.len() > 1 {
+                    "Batch Video Compression"
+                } else {
+                    "Quick Video Compression"
+                });
+                opt_discord_btn.set_visible(true);
+                opt_email_btn.set_visible(true);
+                opt_webp_lossy_btn.set_visible(false);
+                opt_webp_lossless_btn.set_visible(false);
+                opt_jpeg_chat_btn.set_visible(false);
+                opt_resize_50_btn.set_visible(false);
+                opt_strip_exif_btn.set_visible(false);
+            } else {
+                actions_group.set_title(if items.len() > 1 {
+                    "Batch Image Actions"
+                } else {
+                    "Quick Image Actions"
+                });
+                opt_discord_btn.set_visible(false);
+                opt_email_btn.set_visible(false);
+                opt_webp_lossy_btn.set_visible(true);
+                opt_webp_lossless_btn.set_visible(true);
+                opt_jpeg_chat_btn.set_visible(true);
+                opt_resize_50_btn.set_visible(true);
+                opt_strip_exif_btn.set_visible(true);
+            }
+
+            *current_files.borrow_mut() = items;
+            view_stack.set_visible_child_name("actions");
         }
     };
 
     // Reset button
     {
         let view_stack = view_stack.clone();
-        let current_file = current_file.clone();
+        let current_files = current_files.clone();
+        let open_folder_btn = open_folder_btn.clone();
         reset_btn.connect_clicked(move |_| {
-            *current_file.borrow_mut() = None;
+            current_files.borrow_mut().clear();
+            open_folder_btn.set_visible(false);
             view_stack.set_visible_child_name("drop");
         });
     }
 
-    // Drag and Drop Target
+    // Helper: Paste from Clipboard
+    let handle_paste_clipboard = {
+        let update_files = update_files_selected.clone();
+        let toast_overlay = toast_overlay.clone();
+
+        move || {
+            let display = gdk::Display::default().unwrap();
+            let clipboard = display.clipboard();
+
+            let update = update_files.clone();
+            let toast = toast_overlay.clone();
+
+            clipboard.read_texture_async(gio::Cancellable::NONE, move |result| {
+                match result {
+                    Ok(Some(texture)) => {
+                        let temp_dir = env::temp_dir();
+                        let temp_path = temp_dir.join(format!("clipboard_{}.png", glib::monotonic_time()));
+                        if texture.save_to_png(&temp_path).is_ok() {
+                            update(vec![temp_path]);
+                            toast.add_toast(Toast::new("Pasted image from clipboard"));
+                        } else {
+                            toast.add_toast(Toast::new("Failed to save clipboard image"));
+                        }
+                    }
+                    _ => {
+                        toast.add_toast(Toast::new("No image found in clipboard"));
+                    }
+                }
+            });
+        }
+    };
+
+    // Paste button clicked
+    {
+        let handle_paste = handle_paste_clipboard.clone();
+        paste_btn.connect_clicked(move |_| {
+            handle_paste();
+        });
+    }
+
+    // Key Controller: Global Ctrl+V to paste
+    {
+        let key_controller = EventControllerKey::new();
+        let handle_paste = handle_paste_clipboard.clone();
+        key_controller.connect_key_pressed(move |_, key, _, state| {
+            if state.contains(gdk::ModifierType::CONTROL_MASK)
+                && (key == gdk::Key::v || key == gdk::Key::V)
+            {
+                handle_paste();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        window.add_controller(key_controller);
+    }
+
+    // Drag and Drop Target (supports multiple files)
     let drop_target = gtk4::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
     {
-        let update_file_selected = update_file_selected.clone();
+        let update_files = update_files_selected.clone();
         let toast_overlay = toast_overlay.clone();
         drop_target.connect_drop(move |_, value, _, _| {
             if let Ok(file_list) = value.get::<gdk::FileList>() {
-                let files = file_list.files();
-                if let Some(first_file) = files.first() {
-                    if let Some(path) = first_file.path() {
-                        if is_supported_file(&path) {
-                            update_file_selected(path);
-                            return true;
-                        } else {
-                            toast_overlay.add_toast(Toast::new("Unsupported file format"));
-                        }
-                    }
+                let valid_paths: Vec<PathBuf> = file_list
+                    .files()
+                    .into_iter()
+                    .filter_map(|f| f.path())
+                    .filter(|p| is_supported_file(p))
+                    .collect();
+
+                if !valid_paths.is_empty() {
+                    update_files(valid_paths);
+                    return true;
+                } else {
+                    toast_overlay.add_toast(Toast::new("No supported files found in drop"));
                 }
             }
             false
@@ -288,131 +429,169 @@ fn build_ui(app: &Application) {
     }
     window.add_controller(drop_target);
 
-    // File Chooser Button Dialog
+    // File Chooser Button Dialog (Multiple selection allowed)
     {
         let window_clone = window.clone();
-        let update_file_selected = update_file_selected.clone();
+        let update_files = update_files_selected.clone();
         open_file_btn.connect_clicked(move |_| {
             let dialog = gtk4::FileDialog::new();
-            dialog.set_title("Choose File to Compress");
+            dialog.set_title("Choose Files to Compress");
 
-            let update = update_file_selected.clone();
-            dialog.open(Some(&window_clone), gio::Cancellable::NONE, move |result| {
-                if let Ok(file) = result {
-                    if let Some(path) = file.path() {
-                        if is_supported_file(&path) {
-                            update(path);
+            let update = update_files.clone();
+            dialog.open_multiple(Some(&window_clone), gio::Cancellable::NONE, move |result| {
+                if let Ok(list_model) = result {
+                    let mut paths = Vec::new();
+                    for i in 0..list_model.n_items() {
+                        if let Some(file) = list_model.item(i).and_then(|obj| obj.downcast::<gio::File>().ok()) {
+                            if let Some(path) = file.path() {
+                                if is_supported_file(&path) {
+                                    paths.push(path);
+                                }
+                            }
                         }
+                    }
+                    if !paths.is_empty() {
+                        update(paths);
                     }
                 }
             });
         });
     }
 
-    // Helper for async video compression
+    // Helper for async video compression (supports batch)
     let trigger_video_compression = {
-        let current_file = current_file.clone();
+        let current_files = current_files.clone();
         let toast_overlay = toast_overlay.clone();
         let opt_discord_btn = opt_discord_btn.clone();
         let opt_email_btn = opt_email_btn.clone();
+        let open_folder_btn = open_folder_btn.clone();
+        let last_output_dir = last_output_dir.clone();
         let spinner = spinner.clone();
         let progress_bar = progress_bar.clone();
         let status_label = status_label.clone();
         let reset_btn = reset_btn.clone();
 
         move |target_mb: f64| {
-            let file_opt = current_file.borrow().clone();
-            if let Some(info) = file_opt {
-                if !info.is_video {
-                    toast_overlay.add_toast(Toast::new("Selected file is not a video"));
-                    return;
+            let items = current_files.borrow().clone();
+            if items.is_empty() {
+                return;
+            }
+
+            opt_discord_btn.set_sensitive(false);
+            opt_email_btn.set_sensitive(false);
+            reset_btn.set_sensitive(false);
+            open_folder_btn.set_visible(false);
+            spinner.set_visible(true);
+            spinner.start();
+            progress_bar.set_visible(true);
+            status_label.set_visible(true);
+            status_label.set_text(&format!(
+                "Compressing {} video(s) to < {:.0} MB...",
+                items.len(),
+                target_mb
+            ));
+
+            let (sender, receiver) = async_channel::bounded::<Result<(PathBuf, usize, usize), String>>(1);
+
+            let pbar = progress_bar.clone();
+            let pulse_timer = glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                pbar.pulse();
+                glib::ControlFlow::Continue
+            });
+
+            let items_to_process = items.clone();
+            thread::spawn(move || {
+                let total = items_to_process.len();
+                let mut last_saved = PathBuf::new();
+
+                for (idx, item) in items_to_process.iter().enumerate() {
+                    let out_suffix = format!("{:.0}mb", target_mb);
+                    let out_path = video::generate_output_path(&item.path, &out_suffix, "mp4");
+
+                    if let Err(e) = video::compress_video_target_mb(&item.path, &out_path, target_mb) {
+                        let _ = sender.send_blocking(Err(e));
+                        return;
+                    }
+                    last_saved = out_path;
+                    let _ = sender.send_blocking(Ok((last_saved.clone(), idx + 1, total)));
                 }
+            });
 
-                // UI loading state
-                opt_discord_btn.set_sensitive(false);
-                opt_email_btn.set_sensitive(false);
-                reset_btn.set_sensitive(false);
-                spinner.set_visible(true);
-                spinner.start();
-                progress_bar.set_visible(true);
-                status_label.set_visible(true);
-                status_label.set_text(&format!("Compressing video to < {:.0} MB...", target_mb));
+            let toast_overlay = toast_overlay.clone();
+            let opt_discord = opt_discord_btn.clone();
+            let opt_email = opt_email_btn.clone();
+            let open_folder = open_folder_btn.clone();
+            let last_dir = last_output_dir.clone();
+            let reset = reset_btn.clone();
+            let spin = spinner.clone();
+            let pbar = progress_bar.clone();
+            let status_lbl = status_label.clone();
 
-                let out_suffix = format!("{:.0}mb", target_mb);
-                let out_path = video::generate_output_path(&info.path, &out_suffix, "mp4");
-
-                let (sender, receiver) = async_channel::bounded::<Result<PathBuf, String>>(1);
-
-                // Pulse timer
-                let pbar = progress_bar.clone();
-                let pulse_timer = glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-                    pbar.pulse();
-                    glib::ControlFlow::Continue
-                });
-
-                // Spawn worker thread
-                let input_path = info.path.clone();
-                let output_path = out_path.clone();
-                thread::spawn(move || {
-                    let res = video::compress_video_target_mb(&input_path, &output_path, target_mb)
-                        .map(|_| output_path);
-                    let _ = sender.send_blocking(res);
-                });
-
-                // Spawn local async handler on main thread to update UI
-                let toast_overlay = toast_overlay.clone();
-                let opt_discord = opt_discord_btn.clone();
-                let opt_email = opt_email_btn.clone();
-                let reset = reset_btn.clone();
-                let spin = spinner.clone();
-                let pbar = progress_bar.clone();
-                let status_lbl = status_label.clone();
-
-                glib::MainContext::default().spawn_local(async move {
-                    if let Ok(res) = receiver.recv().await {
-                        pulse_timer.remove();
-                        spin.stop();
-                        spin.set_visible(false);
-                        pbar.set_visible(false);
-                        status_lbl.set_visible(false);
-                        opt_discord.set_sensitive(true);
-                        opt_email.set_sensitive(true);
-                        reset.set_sensitive(true);
-
-                        match res {
-                            Ok(saved_path) => {
-                                let size_str = fs::metadata(&saved_path)
-                                    .map(|m| format_bytes(m.len()))
-                                    .unwrap_or_default();
-                                let msg = format!(
-                                    "Saved: {} ({})",
-                                    saved_path
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or("video.mp4"),
-                                    size_str
-                                );
-                                toast_overlay.add_toast(Toast::new(&msg));
+            glib::MainContext::default().spawn_local(async move {
+                while let Ok(msg) = receiver.recv().await {
+                    match msg {
+                        Ok((saved_path, current, total)) => {
+                            status_lbl.set_text(&format!("Compressed {}/{}...", current, total));
+                            if let Some(parent) = saved_path.parent() {
+                                *last_dir.borrow_mut() = Some(parent.to_path_buf());
                             }
-                            Err(err) => {
-                                toast_overlay.add_toast(Toast::new(&format!("Error: {}", err)));
+
+                            if current == total {
+                                pulse_timer.remove();
+                                spin.stop();
+                                spin.set_visible(false);
+                                pbar.set_visible(false);
+                                status_lbl.set_visible(false);
+                                opt_discord.set_sensitive(true);
+                                opt_email.set_sensitive(true);
+                                reset.set_sensitive(true);
+                                open_folder.set_visible(true);
+
+                                let notice = if total == 1 {
+                                    let size_str = fs::metadata(&saved_path)
+                                        .map(|m| format_bytes(m.len()))
+                                        .unwrap_or_default();
+                                    format!(
+                                        "Saved: {} ({})",
+                                        saved_path.file_name().and_then(|n| n.to_str()).unwrap_or("video.mp4"),
+                                        size_str
+                                    )
+                                } else {
+                                    format!("Successfully compressed all {} videos!", total)
+                                };
+                                toast_overlay.add_toast(Toast::new(&notice));
+                                break;
                             }
                         }
+                        Err(err) => {
+                            pulse_timer.remove();
+                            spin.stop();
+                            spin.set_visible(false);
+                            pbar.set_visible(false);
+                            status_lbl.set_visible(false);
+                            opt_discord.set_sensitive(true);
+                            opt_email.set_sensitive(true);
+                            reset.set_sensitive(true);
+                            toast_overlay.add_toast(Toast::new(&format!("Error: {}", err)));
+                            break;
+                        }
                     }
-                });
-            }
+                }
+            });
         }
     };
 
-    // Helper for async image compression
+    // Helper for async image compression (supports batch)
     let trigger_image_compression = {
-        let current_file = current_file.clone();
+        let current_files = current_files.clone();
         let toast_overlay = toast_overlay.clone();
         let opt_webp_lossy_btn = opt_webp_lossy_btn.clone();
         let opt_webp_lossless_btn = opt_webp_lossless_btn.clone();
         let opt_jpeg_chat_btn = opt_jpeg_chat_btn.clone();
         let opt_resize_50_btn = opt_resize_50_btn.clone();
         let opt_strip_exif_btn = opt_strip_exif_btn.clone();
+        let open_folder_btn = open_folder_btn.clone();
+        let last_output_dir = last_output_dir.clone();
         let spinner = spinner.clone();
         let progress_bar = progress_bar.clone();
         let status_label = status_label.clone();
@@ -420,139 +599,166 @@ fn build_ui(app: &Application) {
 
         // mode: 0 = WebP Lossy, 1 = WebP Lossless, 2 = JPEG Chat, 3 = Scale 50%, 4 = Strip EXIF
         move |mode: u8| {
-            let file_opt = current_file.borrow().clone();
-            if let Some(info) = file_opt {
-                if info.is_video {
-                    toast_overlay.add_toast(Toast::new("Selected file is not an image"));
-                    return;
-                }
+            let items = current_files.borrow().clone();
+            if items.is_empty() {
+                return;
+            }
 
-                // UI loading state
-                opt_webp_lossy_btn.set_sensitive(false);
-                opt_webp_lossless_btn.set_sensitive(false);
-                opt_jpeg_chat_btn.set_sensitive(false);
-                opt_resize_50_btn.set_sensitive(false);
-                opt_strip_exif_btn.set_sensitive(false);
-                reset_btn.set_sensitive(false);
-                spinner.set_visible(true);
-                spinner.start();
-                progress_bar.set_visible(true);
-                status_label.set_visible(true);
-                status_label.set_text(match mode {
-                    0 => "Optimizing to WebP (Lossy ~78%)...",
-                    1 => "Converting to WebP (Lossless)...",
-                    2 => "Compressing JPEG for chat...",
-                    3 => "Scaling image down 50%...",
-                    _ => "Stripping EXIF & GPS metadata...",
-                });
+            opt_webp_lossy_btn.set_sensitive(false);
+            opt_webp_lossless_btn.set_sensitive(false);
+            opt_jpeg_chat_btn.set_sensitive(false);
+            opt_resize_50_btn.set_sensitive(false);
+            opt_strip_exif_btn.set_sensitive(false);
+            reset_btn.set_sensitive(false);
+            open_folder_btn.set_visible(false);
+            spinner.set_visible(true);
+            spinner.start();
+            progress_bar.set_visible(true);
+            status_label.set_visible(true);
+            status_label.set_text(match mode {
+                0 => "Optimizing to WebP (Lossy ~78%)...",
+                1 => "Converting to WebP (Lossless)...",
+                2 => "Compressing JPEG for chat...",
+                3 => "Scaling images down 50%...",
+                _ => "Stripping EXIF & GPS metadata...",
+            });
 
-                let orig_ext = info
-                    .path
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("png");
+            let (sender, receiver) = async_channel::bounded::<Result<(PathBuf, usize, usize, u64, u64), String>>(1);
 
-                let (out_suffix, ext) = match mode {
-                    0 => ("optimized", "webp"),
-                    1 => ("lossless", "webp"),
-                    2 => ("chat", "jpg"),
-                    3 => ("scaled50", orig_ext),
-                    _ => ("clean", orig_ext),
-                };
-                let out_path = image_ops::generate_image_output_path(&info.path, out_suffix, ext);
+            let pbar = progress_bar.clone();
+            let pulse_timer = glib::timeout_add_local(std::time::Duration::from_millis(80), move || {
+                pbar.pulse();
+                glib::ControlFlow::Continue
+            });
 
-                let (sender, receiver) = async_channel::bounded::<Result<PathBuf, String>>(1);
+            let items_to_process = items.clone();
+            thread::spawn(move || {
+                let total = items_to_process.len();
+                for (idx, item) in items_to_process.iter().enumerate() {
+                    let orig_ext = item
+                        .path
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("png");
 
-                // Pulse timer
-                let pbar = progress_bar.clone();
-                let pulse_timer = glib::timeout_add_local(std::time::Duration::from_millis(80), move || {
-                    pbar.pulse();
-                    glib::ControlFlow::Continue
-                });
+                    let (out_suffix, ext) = match mode {
+                        0 => ("optimized", "webp"),
+                        1 => ("lossless", "webp"),
+                        2 => ("chat", "jpg"),
+                        3 => ("scaled50", orig_ext),
+                        _ => ("clean", orig_ext),
+                    };
+                    let out_path = image_ops::generate_image_output_path(&item.path, out_suffix, ext);
 
-                // Spawn worker thread
-                let input_path = info.path.clone();
-                let output_path = out_path.clone();
-                thread::spawn(move || {
                     let res = match mode {
-                        0 => image_ops::convert_to_webp(&input_path, &output_path, false),
-                        1 => image_ops::convert_to_webp(&input_path, &output_path, true),
-                        2 => image_ops::optimize_jpeg(&input_path, &output_path, 1920),
-                        3 => image_ops::resize_image(&input_path, &output_path, Some(0.5), None),
-                        _ => image_ops::strip_metadata(&input_path, &output_path),
-                    }
-                    .map(|_| output_path);
+                        0 => image_ops::convert_to_webp(&item.path, &out_path, false),
+                        1 => image_ops::convert_to_webp(&item.path, &out_path, true),
+                        2 => image_ops::optimize_jpeg(&item.path, &out_path, 1920),
+                        3 => image_ops::resize_image(&item.path, &out_path, Some(0.5), None),
+                        _ => image_ops::strip_metadata(&item.path, &out_path),
+                    };
 
-                    let _ = sender.send_blocking(res);
-                });
-
-                // Spawn local async handler on main thread to update UI
-                let toast_overlay = toast_overlay.clone();
-                let opt_webp_lossy = opt_webp_lossy_btn.clone();
-                let opt_webp_lossless = opt_webp_lossless_btn.clone();
-                let opt_jpeg = opt_jpeg_chat_btn.clone();
-                let opt_resize = opt_resize_50_btn.clone();
-                let opt_strip = opt_strip_exif_btn.clone();
-                let reset = reset_btn.clone();
-                let spin = spinner.clone();
-                let pbar = progress_bar.clone();
-                let status_lbl = status_label.clone();
-
-                glib::MainContext::default().spawn_local(async move {
-                    if let Ok(res) = receiver.recv().await {
-                        pulse_timer.remove();
-                        spin.stop();
-                        spin.set_visible(false);
-                        pbar.set_visible(false);
-                        status_lbl.set_visible(false);
-                        opt_webp_lossy.set_sensitive(true);
-                        opt_webp_lossless.set_sensitive(true);
-                        opt_jpeg.set_sensitive(true);
-                        opt_resize.set_sensitive(true);
-                        opt_strip.set_sensitive(true);
-                        reset.set_sensitive(true);
-
-                        match res {
-                            Ok(saved_path) => {
-                                let orig_size = info.size_bytes;
-                                let new_size = fs::metadata(&saved_path)
-                                    .map(|m| m.len())
-                                    .unwrap_or(0);
-                                let saved_pct = if orig_size > new_size && orig_size > 0 {
-                                    ((orig_size - new_size) as f64 / orig_size as f64) * 100.0
-                                } else {
-                                    0.0
-                                };
-
-                                let msg = if saved_pct > 0.0 {
-                                    format!(
-                                        "Saved: {} ({}, -{:.0}%)",
-                                        saved_path
-                                            .file_name()
-                                            .and_then(|n| n.to_str())
-                                            .unwrap_or("image"),
-                                        format_bytes(new_size),
-                                        saved_pct
-                                    )
-                                } else {
-                                    format!(
-                                        "Saved: {} ({})",
-                                        saved_path
-                                            .file_name()
-                                            .and_then(|n| n.to_str())
-                                            .unwrap_or("image"),
-                                        format_bytes(new_size)
-                                    )
-                                };
-                                toast_overlay.add_toast(Toast::new(&msg));
-                            }
-                            Err(err) => {
-                                toast_overlay.add_toast(Toast::new(&format!("Error: {}", err)));
-                            }
+                    match res {
+                        Ok(_) => {
+                            let new_len = fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+                            let _ = sender.send_blocking(Ok((out_path, idx + 1, total, item.size_bytes, new_len)));
+                        }
+                        Err(e) => {
+                            let _ = sender.send_blocking(Err(e));
+                            return;
                         }
                     }
-                });
-            }
+                }
+            });
+
+            let toast_overlay = toast_overlay.clone();
+            let opt_webp_lossy = opt_webp_lossy_btn.clone();
+            let opt_webp_lossless = opt_webp_lossless_btn.clone();
+            let opt_jpeg = opt_jpeg_chat_btn.clone();
+            let opt_resize = opt_resize_50_btn.clone();
+            let opt_strip = opt_strip_exif_btn.clone();
+            let open_folder = open_folder_btn.clone();
+            let last_dir = last_output_dir.clone();
+            let reset = reset_btn.clone();
+            let spin = spinner.clone();
+            let pbar = progress_bar.clone();
+            let status_lbl = status_label.clone();
+
+            glib::MainContext::default().spawn_local(async move {
+                while let Ok(msg) = receiver.recv().await {
+                    match msg {
+                        Ok((saved_path, current, total, orig_size, new_size)) => {
+                            status_lbl.set_text(&format!("Processed {}/{}...", current, total));
+                            if let Some(parent) = saved_path.parent() {
+                                *last_dir.borrow_mut() = Some(parent.to_path_buf());
+                            }
+
+                            if current == total {
+                                pulse_timer.remove();
+                                spin.stop();
+                                spin.set_visible(false);
+                                pbar.set_visible(false);
+                                status_lbl.set_visible(false);
+                                opt_webp_lossy.set_sensitive(true);
+                                opt_webp_lossless.set_sensitive(true);
+                                opt_jpeg.set_sensitive(true);
+                                opt_resize.set_sensitive(true);
+                                opt_strip.set_sensitive(true);
+                                reset.set_sensitive(true);
+                                open_folder.set_visible(true);
+
+                                let notice = if total == 1 {
+                                    let saved_pct = if orig_size > new_size && orig_size > 0 {
+                                        ((orig_size - new_size) as f64 / orig_size as f64) * 100.0
+                                    } else {
+                                        0.0
+                                    };
+
+                                    if saved_pct > 0.0 {
+                                        format!(
+                                            "Saved: {} ({}, -{:.0}%)",
+                                            saved_path
+                                                .file_name()
+                                                .and_then(|n| n.to_str())
+                                                .unwrap_or("image"),
+                                            format_bytes(new_size),
+                                            saved_pct
+                                        )
+                                    } else {
+                                        format!(
+                                            "Saved: {} ({})",
+                                            saved_path
+                                                .file_name()
+                                                .and_then(|n| n.to_str())
+                                                .unwrap_or("image"),
+                                            format_bytes(new_size)
+                                        )
+                                    }
+                                } else {
+                                    format!("Successfully processed all {} images!", total)
+                                };
+                                toast_overlay.add_toast(Toast::new(&notice));
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            pulse_timer.remove();
+                            spin.stop();
+                            spin.set_visible(false);
+                            pbar.set_visible(false);
+                            status_lbl.set_visible(false);
+                            opt_webp_lossy.set_sensitive(true);
+                            opt_webp_lossless.set_sensitive(true);
+                            opt_jpeg.set_sensitive(true);
+                            opt_resize.set_sensitive(true);
+                            opt_strip.set_sensitive(true);
+                            reset.set_sensitive(true);
+                            toast_overlay.add_toast(Toast::new(&format!("Error: {}", err)));
+                            break;
+                        }
+                    }
+                }
+            });
         }
     };
 
@@ -560,14 +766,14 @@ fn build_ui(app: &Application) {
     {
         let trigger = trigger_video_compression.clone();
         opt_discord_btn.connect_clicked(move |_| {
-            trigger(9.5); // Discord 10 MB limit safe target
+            trigger(9.5);
         });
     }
 
     {
         let trigger = trigger_video_compression;
         opt_email_btn.connect_clicked(move |_| {
-            trigger(24.0); // 25 MB email/telegram safe target
+            trigger(24.0);
         });
     }
 
@@ -575,35 +781,35 @@ fn build_ui(app: &Application) {
     {
         let trigger = trigger_image_compression.clone();
         opt_webp_lossy_btn.connect_clicked(move |_| {
-            trigger(0); // WebP Lossy (Optimized)
+            trigger(0);
         });
     }
 
     {
         let trigger = trigger_image_compression.clone();
         opt_webp_lossless_btn.connect_clicked(move |_| {
-            trigger(1); // WebP Lossless
+            trigger(1);
         });
     }
 
     {
         let trigger = trigger_image_compression.clone();
         opt_jpeg_chat_btn.connect_clicked(move |_| {
-            trigger(2); // JPEG Chat
+            trigger(2);
         });
     }
 
     {
         let trigger = trigger_image_compression.clone();
         opt_resize_50_btn.connect_clicked(move |_| {
-            trigger(3); // Resize 50%
+            trigger(3);
         });
     }
 
     {
         let trigger = trigger_image_compression;
         opt_strip_exif_btn.connect_clicked(move |_| {
-            trigger(4); // Strip EXIF & GPS
+            trigger(4);
         });
     }
 
