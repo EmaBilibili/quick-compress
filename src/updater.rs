@@ -61,10 +61,17 @@ pub fn check_for_updates() -> Result<UpdateCheckResult, String> {
 
     let has_update = latest_tag != current && is_newer_version(&latest_tag, current);
 
+    // Look specifically for the raw standalone executable binary first
     let download_url = response
         .assets
         .iter()
-        .find(|a| a.name.contains("quick-compress") || a.name.ends_with(".tar.gz") || a.name.ends_with(".AppImage"))
+        .find(|a| a.name == "quick-compress-x86_64" || a.name == "quick-compress")
+        .or_else(|| {
+            response
+                .assets
+                .iter()
+                .find(|a| a.name.contains("quick-compress") && !a.name.ends_with(".tar.gz") && !a.name.ends_with(".zip"))
+        })
         .map(|a| a.browser_download_url.clone());
 
     Ok(UpdateCheckResult {
