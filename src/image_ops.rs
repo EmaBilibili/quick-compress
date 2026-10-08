@@ -13,7 +13,6 @@ pub fn convert_to_webp(input: &Path, output: &Path, quality_lossless: bool) -> R
     if quality_lossless {
         cmd.args(["-c:v", "libwebp", "-lossless", "1", "-compression_level", "6"]);
     } else {
-        // High efficiency lossy WebP at quality 78 with photo preset
         cmd.args([
             "-c:v",
             "libwebp",
@@ -72,6 +71,64 @@ pub fn optimize_jpeg(input: &Path, output: &Path, max_dimension: u32) -> Result<
             image::ExtendedColorType::Rgb8,
         )
         .map_err(|e| format!("Failed to encode JPEG: {}", e))?;
+
+    Ok(())
+}
+
+/// Strip all EXIF / GPS / camera metadata by decoding raw pixel buffer and writing clean file
+pub fn strip_metadata(input: &Path, output: &Path) -> Result<(), String> {
+    let reader = ImageReader::open(input)
+        .map_err(|e| format!("Failed to read image: {}", e))?
+        .with_guessed_format()
+        .map_err(|e| format!("Failed to detect format: {}", e))?;
+
+    let format = reader.format().unwrap_or(image::ImageFormat::Jpeg);
+    let img = reader
+        .decode()
+        .map_err(|e| format!("Failed to decode image: {}", e))?;
+
+    let out_file = File::create(output).map_err(|e| format!("Failed to create output file: {}", e))?;
+    let mut writer = BufWriter::new(out_file);
+
+    img.write_to(&mut writer, format)
+        .map_err(|e| format!("Failed to save clean image: {}", e))?;
+
+    Ok(())
+}
+
+/// Scale image by percentage (e.g. 50%) or fit into square avatar box (e.g. 512x512)
+pub fn resize_image(
+    input: &Path,
+    output: &Path,
+    scale_factor: Option<f32>,
+    exact_box: Option<(u32, u32)>,
+) -> Result<(), String> {
+    let reader = ImageReader::open(input)
+        .map_err(|e| format!("Failed to read image: {}", e))?
+        .with_guessed_format()
+        .map_err(|e| format!("Failed to detect format: {}", e))?;
+
+    let format = reader.format().unwrap_or(image::ImageFormat::Png);
+    let img = reader
+        .decode()
+        .map_err(|e| format!("Failed to decode image: {}", e))?;
+
+    let processed = if let Some(factor) = scale_factor {
+        let new_w = ((img.width() as f32 * factor).round() as u32).max(1);
+        let new_h = ((img.height() as f32 * factor).round() as u32).max(1);
+        img.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3)
+    } else if let Some((target_w, target_h)) = exact_box {
+        img.resize_to_fill(target_w, target_h, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
+    };
+
+    let out_file = File::create(output).map_err(|e| format!("Failed to create output file: {}", e))?;
+    let mut writer = BufWriter::new(out_file);
+
+    processed
+        .write_to(&mut writer, format)
+        .map_err(|e| format!("Failed to write resized image: {}", e))?;
 
     Ok(())
 }

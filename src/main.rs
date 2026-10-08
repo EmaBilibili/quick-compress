@@ -131,8 +131,9 @@ fn build_ui(app: &Application) {
     opt_webp_lossy_btn.add_css_class("suggested-action");
 
     let opt_webp_lossless_btn = Button::with_label("Convert to WebP (Lossless for PNGs/Art)");
-
     let opt_jpeg_chat_btn = Button::with_label("Compress JPEG (Max 1920px, 80% Quality)");
+    let opt_resize_50_btn = Button::with_label("Scale Down 50% (Halve Dimensions)");
+    let opt_strip_exif_btn = Button::with_label("Strip EXIF & Privacy Metadata (GPS/Camera)");
 
     // Progress bar and spinner
     let spinner = Spinner::new();
@@ -156,6 +157,8 @@ fn build_ui(app: &Application) {
     actions_box.append(&opt_webp_lossy_btn);
     actions_box.append(&opt_webp_lossless_btn);
     actions_box.append(&opt_jpeg_chat_btn);
+    actions_box.append(&opt_resize_50_btn);
+    actions_box.append(&opt_strip_exif_btn);
     actions_box.append(&spinner);
     actions_box.append(&progress_bar);
     actions_box.append(&status_label);
@@ -197,6 +200,8 @@ fn build_ui(app: &Application) {
         let opt_webp_lossy_btn = opt_webp_lossy_btn.clone();
         let opt_webp_lossless_btn = opt_webp_lossless_btn.clone();
         let opt_jpeg_chat_btn = opt_jpeg_chat_btn.clone();
+        let opt_resize_50_btn = opt_resize_50_btn.clone();
+        let opt_strip_exif_btn = opt_strip_exif_btn.clone();
 
         move |path: PathBuf| {
             if let Ok(metadata) = fs::metadata(&path) {
@@ -224,6 +229,8 @@ fn build_ui(app: &Application) {
                     opt_webp_lossy_btn.set_visible(false);
                     opt_webp_lossless_btn.set_visible(false);
                     opt_jpeg_chat_btn.set_visible(false);
+                    opt_resize_50_btn.set_visible(false);
+                    opt_strip_exif_btn.set_visible(false);
                 } else {
                     actions_group.set_title("Quick Image Actions");
                     opt_discord_btn.set_visible(false);
@@ -231,6 +238,8 @@ fn build_ui(app: &Application) {
                     opt_webp_lossy_btn.set_visible(true);
                     opt_webp_lossless_btn.set_visible(true);
                     opt_jpeg_chat_btn.set_visible(true);
+                    opt_resize_50_btn.set_visible(true);
+                    opt_strip_exif_btn.set_visible(true);
                 }
 
                 *current_file.borrow_mut() = Some(FileInfo {
@@ -402,12 +411,14 @@ fn build_ui(app: &Application) {
         let opt_webp_lossy_btn = opt_webp_lossy_btn.clone();
         let opt_webp_lossless_btn = opt_webp_lossless_btn.clone();
         let opt_jpeg_chat_btn = opt_jpeg_chat_btn.clone();
+        let opt_resize_50_btn = opt_resize_50_btn.clone();
+        let opt_strip_exif_btn = opt_strip_exif_btn.clone();
         let spinner = spinner.clone();
         let progress_bar = progress_bar.clone();
         let status_label = status_label.clone();
         let reset_btn = reset_btn.clone();
 
-        // mode: 0 = WebP Lossy (Optimized), 1 = WebP Lossless, 2 = JPEG Chat
+        // mode: 0 = WebP Lossy, 1 = WebP Lossless, 2 = JPEG Chat, 3 = Scale 50%, 4 = Strip EXIF
         move |mode: u8| {
             let file_opt = current_file.borrow().clone();
             if let Some(info) = file_opt {
@@ -420,6 +431,8 @@ fn build_ui(app: &Application) {
                 opt_webp_lossy_btn.set_sensitive(false);
                 opt_webp_lossless_btn.set_sensitive(false);
                 opt_jpeg_chat_btn.set_sensitive(false);
+                opt_resize_50_btn.set_sensitive(false);
+                opt_strip_exif_btn.set_sensitive(false);
                 reset_btn.set_sensitive(false);
                 spinner.set_visible(true);
                 spinner.start();
@@ -428,13 +441,23 @@ fn build_ui(app: &Application) {
                 status_label.set_text(match mode {
                     0 => "Optimizing to WebP (Lossy ~78%)...",
                     1 => "Converting to WebP (Lossless)...",
-                    _ => "Compressing JPEG for chat...",
+                    2 => "Compressing JPEG for chat...",
+                    3 => "Scaling image down 50%...",
+                    _ => "Stripping EXIF & GPS metadata...",
                 });
+
+                let orig_ext = info
+                    .path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("png");
 
                 let (out_suffix, ext) = match mode {
                     0 => ("optimized", "webp"),
                     1 => ("lossless", "webp"),
-                    _ => ("chat", "jpg"),
+                    2 => ("chat", "jpg"),
+                    3 => ("scaled50", orig_ext),
+                    _ => ("clean", orig_ext),
                 };
                 let out_path = image_ops::generate_image_output_path(&info.path, out_suffix, ext);
 
@@ -454,7 +477,9 @@ fn build_ui(app: &Application) {
                     let res = match mode {
                         0 => image_ops::convert_to_webp(&input_path, &output_path, false),
                         1 => image_ops::convert_to_webp(&input_path, &output_path, true),
-                        _ => image_ops::optimize_jpeg(&input_path, &output_path, 1920),
+                        2 => image_ops::optimize_jpeg(&input_path, &output_path, 1920),
+                        3 => image_ops::resize_image(&input_path, &output_path, Some(0.5), None),
+                        _ => image_ops::strip_metadata(&input_path, &output_path),
                     }
                     .map(|_| output_path);
 
@@ -466,6 +491,8 @@ fn build_ui(app: &Application) {
                 let opt_webp_lossy = opt_webp_lossy_btn.clone();
                 let opt_webp_lossless = opt_webp_lossless_btn.clone();
                 let opt_jpeg = opt_jpeg_chat_btn.clone();
+                let opt_resize = opt_resize_50_btn.clone();
+                let opt_strip = opt_strip_exif_btn.clone();
                 let reset = reset_btn.clone();
                 let spin = spinner.clone();
                 let pbar = progress_bar.clone();
@@ -481,6 +508,8 @@ fn build_ui(app: &Application) {
                         opt_webp_lossy.set_sensitive(true);
                         opt_webp_lossless.set_sensitive(true);
                         opt_jpeg.set_sensitive(true);
+                        opt_resize.set_sensitive(true);
+                        opt_strip.set_sensitive(true);
                         reset.set_sensitive(true);
 
                         match res {
@@ -558,9 +587,23 @@ fn build_ui(app: &Application) {
     }
 
     {
-        let trigger = trigger_image_compression;
+        let trigger = trigger_image_compression.clone();
         opt_jpeg_chat_btn.connect_clicked(move |_| {
             trigger(2); // JPEG Chat
+        });
+    }
+
+    {
+        let trigger = trigger_image_compression.clone();
+        opt_resize_50_btn.connect_clicked(move |_| {
+            trigger(3); // Resize 50%
+        });
+    }
+
+    {
+        let trigger = trigger_image_compression;
+        opt_strip_exif_btn.connect_clicked(move |_| {
+            trigger(4); // Strip EXIF & GPS
         });
     }
 
