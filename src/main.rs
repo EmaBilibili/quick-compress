@@ -316,6 +316,14 @@ fn build_ui(app: &Application) {
         .build();
     header_bar.pack_end(&prefs_btn);
 
+    // Clear / Cancel button in header bar
+    let clear_header_btn = Button::builder()
+        .icon_name("edit-clear-all-symbolic")
+        .tooltip_text("Clear Selection")
+        .visible(false)
+        .build();
+    header_bar.pack_start(&clear_header_btn);
+
     let view_stack = ViewStack::new();
 
     // 1. Drop Zone (Initial View)
@@ -542,6 +550,7 @@ fn build_ui(app: &Application) {
         let opt_resize_50_btn = opt_resize_50_btn.clone();
         let opt_strip_exif_btn = opt_strip_exif_btn.clone();
         let open_folder_btn = open_folder_btn.clone();
+        let clear_header_btn = clear_header_btn.clone();
 
         move |paths: Vec<PathBuf>| {
             let mut items = Vec::new();
@@ -638,23 +647,36 @@ fn build_ui(app: &Application) {
             }
 
             *current_files.borrow_mut() = items;
+            clear_header_btn.set_visible(true);
             view_stack.set_visible_child_name("actions");
         }
     };
 
-    // Reset button
+    // Reset button & Header Clear button
     {
         let view_stack = view_stack.clone();
         let current_files = current_files.clone();
         let preview_picture = preview_picture.clone();
         let trim_group = trim_group.clone();
         let open_folder_btn = open_folder_btn.clone();
-        reset_btn.connect_clicked(move |_| {
+        let clear_header_btn_clone = clear_header_btn.clone();
+
+        let do_clear = move || {
             current_files.borrow_mut().clear();
             preview_picture.set_visible(false);
             trim_group.set_visible(false);
             open_folder_btn.set_visible(false);
+            clear_header_btn_clone.set_visible(false);
             view_stack.set_visible_child_name("drop");
+        };
+
+        let do_clear_clone = do_clear.clone();
+        reset_btn.connect_clicked(move |_| {
+            do_clear_clone();
+        });
+
+        clear_header_btn.connect_clicked(move |_| {
+            do_clear();
         });
     }
 
