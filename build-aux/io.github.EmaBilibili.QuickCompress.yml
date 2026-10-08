@@ -1,0 +1,58 @@
+app-id: io.github.EmaBilibili.QuickCompress
+runtime: org.gnome.Platform
+runtime-version: '46'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: quick-compress
+
+finish-args:
+  # Display and Wayland/X11
+  - --socket=wayland
+  - --socket=fallback-x11
+  # Audio and Hardware Video Acceleration
+  - --socket=pulseaudio
+  - --device=dri
+  # File access to read/write compressed files and open folders
+  - --filesystem=xdg-download
+  - --filesystem=xdg-pictures
+  - --filesystem=xdg-videos
+  - --filesystem=home:ro
+  # Network for GitHub update checks
+  - --share=network
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/quick-compress/cargo
+
+modules:
+  - name: ffmpeg
+    cleanup:
+      - /include
+      - /lib/pkgconfig
+      - /share/ffmpeg/examples
+    config-opts:
+      - --enable-shared
+      - --disable-static
+      - --enable-gpl
+      - --enable-version3
+      - --enable-libwebp
+      - --enable-libx264
+    sources:
+      - type: archive
+        url: https://ffmpeg.org/releases/ffmpeg-6.1.1.tar.xz
+        sha256: 86dd58784f605e19ff51888907854cd75123a6679e37d945ea79c94132b49890
+
+  - name: quick-compress
+    buildsystem: simple
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml
+      - cargo --offline build --release --verbose
+      - install -Dm755 target/release/quick-compress /app/bin/quick-compress
+      - install -Dm644 data/io.github.EmaBilibili.QuickCompress.desktop /app/share/applications/io.github.EmaBilibili.QuickCompress.desktop
+      - install -Dm644 data/io.github.EmaBilibili.QuickCompress.metainfo.xml /app/share/metainfo/io.github.EmaBilibili.QuickCompress.metainfo.xml
+      - install -Dm644 data/icons/io.github.EmaBilibili.QuickCompress.svg /app/share/icons/hicolor/scalable/apps/io.github.EmaBilibili.QuickCompress.svg
+    sources:
+      - type: dir
+        path: .

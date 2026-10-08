@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3584e4"/>
+      <stop offset="100%" stop-color="#1c71d8"/>
+    </linearGradient>
+    <linearGradient id="bolt" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f6d32d"/>
+      <stop offset="100%" stop-color="#e5a50a"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="4" stdDeviation="4" flood-opacity="0.25"/>
+    </filter>
+  </defs>
+
+  <!-- Base Rounded Squircle -->
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#bg)" filter="url(#shadow)"/>
+
+  <!-- Inward Compression Arrows -->
+  <g fill="#ffffff" opacity="0.9">
+    <!-- Top Arrow pointing down -->
+    <path d="M64 24 L52 38 L60 38 L60 48 L68 48 L68 38 L76 38 Z"/>
+    <!-- Bottom Arrow pointing up -->
+    <path d="M64 104 L52 90 L60 90 L60 80 L68 80 L68 90 L76 90 Z"/>
+    <!-- Left Arrow pointing right -->
+    <path d="M24 64 L38 52 L38 60 L48 60 L48 68 L38 68 L38 76 Z"/>
+    <!-- Right Arrow pointing left -->
+    <path d="M104 64 L90 52 L90 60 L80 60 L80 68 L90 68 L90 76 Z"/>
+  </g>
+
+  <!-- Center Lightning Bolt (Fast) -->
+  <polygon points="68,48 52,68 62,68 58,82 78,60 67,60" fill="url(#bolt)" filter="url(#shadow)"/>
+</svg>

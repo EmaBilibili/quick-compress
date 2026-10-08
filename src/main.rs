@@ -1,15 +1,16 @@
 mod image_ops;
+mod updater;
 mod video;
 
 use gtk4::gdk;
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::{Button, EventControllerKey, ProgressBar, Spinner};
+use gtk4::{Button, EventControllerKey, Picture, ProgressBar, Spinner};
 use libadwaita::prelude::*;
 use libadwaita::{
-    ActionRow, Application, ApplicationWindow, HeaderBar, PreferencesGroup, StatusPage,
-    Toast, ToastOverlay, ViewStack,
+    ActionRow, Application, ApplicationWindow, HeaderBar, MessageDialog, PreferencesGroup,
+    PreferencesPage, PreferencesWindow, StatusPage, Toast, ToastOverlay, ViewStack,
 };
 use std::cell::RefCell;
 use std::env;
@@ -76,6 +77,154 @@ fn open_folder_containing(path: &Path) {
     let _ = Command::new("xdg-open").arg(target).spawn();
 }
 
+fn show_preferences_window(parent: &ApplicationWindow) {
+    let prefs = PreferencesWindow::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title("Preferences")
+        .default_width(450)
+        .default_height(400)
+        .build();
+
+    let page = PreferencesPage::new();
+
+    // General Group
+    let general_group = PreferencesGroup::builder()
+        .title("General")
+        .description("Default behavior for QuickCompress")
+        .build();
+
+    let version_row = ActionRow::builder()
+        .title("Version")
+        .subtitle(updater::CURRENT_VERSION)
+        .build();
+    general_group.add(&version_row);
+
+    // Updates Group
+    let updates_group = PreferencesGroup::builder()
+        .title("Updates")
+        .description("Keep QuickCompress up to date")
+        .build();
+
+    let check_updates_row = ActionRow::builder()
+        .title("Check for Updates")
+        .subtitle("Verify if a new version is published on GitHub")
+        .activatable(true)
+        .build();
+
+    let check_btn = Button::with_label("Check Now");
+    check_btn.add_css_class("flat");
+    check_updates_row.add_suffix(&check_btn);
+    updates_group.add(&check_updates_row);
+
+    let parent_clone = parent.clone();
+    check_btn.connect_clicked(move |btn| {
+        btn.set_sensitive(false);
+        let parent = parent_clone.clone();
+        let btn_clone = btn.clone();
+
+        let (sender, receiver) = async_channel::bounded::<Result<updater::UpdateCheckResult, String>>(1);
+
+        thread::spawn(move || {
+            let res = updater::check_for_updates();
+            let _ = sender.send_blocking(res);
+        });
+
+        glib::MainContext::default().spawn_local(async move {
+            if let Ok(res) = receiver.recv().await {
+                btn_clone.set_sensitive(true);
+                match res {
+                    Ok(info) if info.has_update => {
+                        prompt_update_dialog(&parent, &info);
+                    }
+                    Ok(_) => {
+                        let dialog = MessageDialog::builder()
+                            .transient_for(&parent)
+                            .heading("You're Up to Date!")
+                            .body(&format!(
+                                "QuickCompress v{} is the latest version available.",
+                                updater::CURRENT_VERSION
+                            ))
+                            .build();
+                        dialog.add_response("ok", "OK");
+                        dialog.present();
+                    }
+                    Err(e) => {
+                        let dialog = MessageDialog::builder()
+                            .transient_for(&parent)
+                            .heading("Check Failed")
+                            .body(&e)
+                            .build();
+                        dialog.add_response("ok", "OK");
+                        dialog.present();
+                    }
+                }
+            }
+        });
+    });
+
+    page.add(&general_group);
+    page.add(&updates_group);
+    prefs.add(&page);
+    prefs.present();
+}
+
+fn prompt_update_dialog(parent: &ApplicationWindow, info: &updater::UpdateCheckResult) {
+    let dialog = MessageDialog::builder()
+        .transient_for(parent)
+        .heading(&format!("Update Available: v{}", info.latest_version))
+        .body(&format!(
+            "A newer version of QuickCompress was released.\n\nRelease notes:\n{}\n\nWould you like to update now?",
+            info.release_notes
+        ))
+        .build();
+
+    dialog.add_response("cancel", "Not Now");
+    dialog.add_response("update", "Update & Restart");
+    dialog.set_response_appearance("update", libadwaita::ResponseAppearance::Suggested);
+
+    let info_clone = info.clone();
+    let parent_clone = parent.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response == "update" {
+            if let Some(url) = &info_clone.download_url {
+                let download_url = url.clone();
+                let parent = parent_clone.clone();
+
+                let loading_dialog = MessageDialog::builder()
+                    .transient_for(&parent)
+                    .heading("Updating QuickCompress...")
+                    .body("Downloading new version and preparing restart. Please wait...")
+                    .build();
+                loading_dialog.present();
+
+                let (sender, receiver) = async_channel::bounded::<Result<(), String>>(1);
+
+                thread::spawn(move || {
+                    let res = updater::perform_self_update_and_restart(&download_url);
+                    let _ = sender.send_blocking(res);
+                });
+
+                glib::MainContext::default().spawn_local(async move {
+                    if let Ok(Err(e)) = receiver.recv().await {
+                        loading_dialog.close();
+                        let err_dialog = MessageDialog::builder()
+                            .heading("Update Failed")
+                            .body(&e)
+                            .build();
+                        err_dialog.add_response("ok", "OK");
+                        err_dialog.present();
+                    }
+                });
+            } else {
+                let _ = Command::new("xdg-open").arg(&info_clone.release_url).spawn();
+            }
+        }
+    });
+
+    dialog.present();
+}
+
 fn main() {
     let app = Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_ui);
@@ -85,6 +234,13 @@ fn main() {
 fn build_ui(app: &Application) {
     let header_bar = HeaderBar::new();
     let toast_overlay = ToastOverlay::new();
+
+    // Preferences button in header bar
+    let prefs_btn = Button::builder()
+        .icon_name("open-menu-symbolic")
+        .tooltip_text("Settings & Preferences")
+        .build();
+    header_bar.pack_end(&prefs_btn);
 
     let view_stack = ViewStack::new();
 
@@ -120,6 +276,16 @@ fn build_ui(app: &Application) {
     view_stack.add_titled(&drop_box, Some("drop"), "Drop");
 
     // 2. File Selected & Compression Actions View
+    // Image thumbnail preview widget
+    let preview_picture = Picture::builder()
+        .can_shrink(true)
+        .content_fit(gtk4::ContentFit::Contain)
+        .height_request(160)
+        .margin_top(8)
+        .margin_bottom(8)
+        .visible(false)
+        .build();
+
     let file_group = PreferencesGroup::builder()
         .title("Selected Files")
         .margin_top(16)
@@ -199,6 +365,7 @@ fn build_ui(app: &Application) {
     actions_group.add(&actions_box);
 
     let details_container = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    details_container.append(&preview_picture);
     details_container.append(&file_group);
     details_container.append(&actions_group);
 
@@ -215,9 +382,37 @@ fn build_ui(app: &Application) {
         .application(app)
         .title("QuickCompress")
         .default_width(540)
-        .default_height(520)
+        .default_height(540)
         .content(&toast_overlay)
         .build();
+
+    // Connect preferences button
+    {
+        let window_clone = window.clone();
+        prefs_btn.connect_clicked(move |_| {
+            show_preferences_window(&window_clone);
+        });
+    }
+
+    // Startup background check for updates (silent, prompts modal if new version exists)
+    {
+        let window_clone = window.clone();
+        let (sender, receiver) = async_channel::bounded::<updater::UpdateCheckResult>(1);
+
+        thread::spawn(move || {
+            if let Ok(info) = updater::check_for_updates() {
+                if info.has_update {
+                    let _ = sender.send_blocking(info);
+                }
+            }
+        });
+
+        glib::MainContext::default().spawn_local(async move {
+            if let Ok(info) = receiver.recv().await {
+                prompt_update_dialog(&window_clone, &info);
+            }
+        });
+    }
 
     let current_files: Rc<RefCell<Vec<FileItem>>> = Rc::new(RefCell::new(Vec::new()));
     let last_output_dir: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
@@ -237,6 +432,7 @@ fn build_ui(app: &Application) {
         let view_stack = view_stack.clone();
         let file_row = file_row.clone();
         let file_row_icon = file_row_icon.clone();
+        let preview_picture = preview_picture.clone();
         let current_files = current_files.clone();
         let actions_group = actions_group.clone();
         let opt_discord_btn = opt_discord_btn.clone();
@@ -295,10 +491,19 @@ fn build_ui(app: &Application) {
                 } else {
                     "image-x-generic-symbolic"
                 }));
+
+                // Load thumbnail if it's an image
+                if !first.is_video {
+                    preview_picture.set_filename(Some(&first.path));
+                    preview_picture.set_visible(true);
+                } else {
+                    preview_picture.set_visible(false);
+                }
             } else {
                 file_row.set_title(&format!("{} files selected", items.len()));
                 file_row.set_subtitle(&format!("Total size: {}", format_bytes(total_size)));
                 file_row_icon.set_icon_name(Some("emblem-documents-symbolic"));
+                preview_picture.set_visible(false);
             }
 
             // Adapt action buttons based on file types
@@ -339,9 +544,11 @@ fn build_ui(app: &Application) {
     {
         let view_stack = view_stack.clone();
         let current_files = current_files.clone();
+        let preview_picture = preview_picture.clone();
         let open_folder_btn = open_folder_btn.clone();
         reset_btn.connect_clicked(move |_| {
             current_files.borrow_mut().clear();
+            preview_picture.set_visible(false);
             open_folder_btn.set_visible(false);
             view_stack.set_visible_child_name("drop");
         });

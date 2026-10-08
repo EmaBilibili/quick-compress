@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=QuickCompress
+GenericName=Image & Video Compressor
+Comment=Fast, native utility to compress and convert images, audio, and video for chat and web
+Exec=quick-compress %F
+Icon=io.github.EmaBilibili.QuickCompress
+Terminal=false
+Type=Application
+Categories=GTK;GNOME;Utility;AudioVideo;Graphics;
+MimeType=image/png;image/jpeg;image/webp;image/bmp;video/mp4;video/x-matroska;video/quicktime;video/webm;
+Keywords=compress;optimizer;video;image;convert;webp;discord;shrink;
+StartupNotify=true

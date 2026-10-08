@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.EmaBilibili.QuickCompress</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>QuickCompress</name>
+  <summary>Compress and convert images, audio, and videos for chat and web</summary>
+  <description>
+    <p>
+      QuickCompress is a fast, lightweight, and modern utility built with GTK4 and Libadwaita for Linux.
+      It helps you instantly shrink videos for Discord and WhatsApp, optimize photos to WebP, resize images,
+      and strip sensitive GPS camera metadata.
+    </p>
+    <ul>
+      <li>Drag-and-drop or paste directly from clipboard (Ctrl+V)</li>
+      <li>Automatic video bitrate calculation to fit 10 MB or 25 MB limits</li>
+      <li>High efficiency WebP and JPEG compression</li>
+      <li>Batch processing for multiple files at once</li>
+      <li>Privacy protection with one-click EXIF stripping</li>
+    </ul>
+  </description>
+  <url type="homepage">https://github.com/EmaBilibili/quick-compress</url>
+  <url type="bugtracker">https://github.com/EmaBilibili/quick-compress/issues</url>
+  <developer_name>Emanuel Binimelis</developer_name>
+  <launchable type="desktop-id">io.github.EmaBilibili.QuickCompress.desktop</launchable>
+  <provides>
+    <binary>quick-compress</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-10-08">
+      <description>
+        <p>Initial release with batch support, clipboard pasting, video compression, and WebP optimizer.</p>
+      </description>
+    </release>
+  </releases>
+</component>
