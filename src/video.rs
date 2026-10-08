@@ -41,6 +41,8 @@ pub fn extract_video_frame(input: &Path, seconds: f64, output: &Path) -> Result<
         .args([
             "-vframes",
             "1",
+            "-vf",
+            "scale='min(640,iw)':-2",
             "-q:v",
             "2",
             "-update",

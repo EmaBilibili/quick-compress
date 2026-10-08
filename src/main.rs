@@ -17,8 +17,9 @@ use std::cell::RefCell;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 const APP_ID: &str = "io.github.EmaBilibili.QuickCompress";
@@ -57,6 +58,31 @@ fn format_time_display(seconds: f64) -> String {
     let mins = s / 60;
     let secs = s % 60;
     format!("{:02}:{:02}", mins, secs)
+}
+
+fn parse_time_str(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    if s.contains(':') {
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() == 2 {
+            let mins: f64 = parts[0].parse().ok()?;
+            let secs: f64 = parts[1].parse().ok()?;
+            return Some(mins * 60.0 + secs);
+        }
+    }
+
+    s.parse::<f64>().ok()
+}
+
+static FRAME_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn get_next_preview_frame_path() -> PathBuf {
+    let id = FRAME_COUNTER.fetch_add(1, Ordering::Relaxed) % 4;
+    env::temp_dir().join(format!("quickcompress_preview_{}.jpg", id))
 }
 
 fn is_supported_file(path: &Path) -> bool {
@@ -420,10 +446,12 @@ fn build_ui(app: &Application) {
     timeline_box.set_margin_bottom(8);
     timeline_box.append(&timeline_scale);
     timeline_box.append(&time_pos_label);
+    trim_group.add(&video_preview_picture);
     trim_group.add(&timeline_box);
 
     let play_preview_btn = Button::builder()
-        .label("Play Full Video")
+        .label("Play Audio/Video")
+        .tooltip_text("Preview video and hear audio with playback")
         .icon_name("media-playback-start-symbolic")
         .css_classes(["pill", "flat"])
         .build();
@@ -495,7 +523,7 @@ fn build_ui(app: &Application) {
             ));
 
             if let Some(vid_path) = current_video_path.borrow().clone() {
-                let temp_frame = env::temp_dir().join("quickcompress_preview.jpg");
+                let temp_frame = get_next_preview_frame_path();
                 let (sender, receiver) = async_channel::bounded::<PathBuf>(1);
                 let pic = video_preview_picture.clone();
 
@@ -515,12 +543,87 @@ fn build_ui(app: &Application) {
         });
     }
 
-    // Play preview in default video player (e.g. mpv, vlc, totem, kaffeine)
+    let play_child: Rc<RefCell<Option<Child>>> = Rc::new(RefCell::new(None));
+
+    // Play/Stop preview with audio and video window (via ffplay with autoexit)
     {
         let current_video_path = current_video_path.clone();
+        let play_child = play_child.clone();
+        let play_preview_btn_clone = play_preview_btn.clone();
+        let timeline_scale = timeline_scale.clone();
+        let trim_start_entry = trim_start_entry.clone();
+        let trim_end_entry = trim_end_entry.clone();
+
         play_preview_btn.connect_clicked(move |_| {
+            let mut child_guard = play_child.borrow_mut();
+            if let Some(mut child) = child_guard.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+                play_preview_btn_clone.set_label("Play Audio/Video");
+                play_preview_btn_clone.set_icon_name("media-playback-start-symbolic");
+                return;
+            }
+
             if let Some(vid_path) = current_video_path.borrow().as_ref() {
-                let _ = Command::new("xdg-open").arg(vid_path).spawn();
+                let current_slider = timeline_scale.value();
+                let start_val = parse_time_str(&trim_start_entry.text()).unwrap_or(current_slider);
+                let end_val = parse_time_str(&trim_end_entry.text());
+
+                let mut cmd = Command::new("ffplay");
+                cmd.args([
+                    "-window_title",
+                    "QuickCompress - Audio/Video Preview",
+                    "-x",
+                    "720",
+                    "-ss",
+                    &format!("{:.2}", start_val),
+                ]);
+
+                if let Some(end) = end_val {
+                    if end > start_val {
+                        cmd.args(["-t", &format!("{:.2}", end - start_val)]);
+                    }
+                }
+
+                cmd.arg(vid_path);
+                cmd.arg("-autoexit");
+
+                match cmd.spawn() {
+                    Ok(proc) => {
+                        *child_guard = Some(proc);
+                        play_preview_btn_clone.set_label("Stop Playing");
+                        play_preview_btn_clone.set_icon_name("media-playback-stop-symbolic");
+
+                        let play_child_clone = play_child.clone();
+                        let btn_clone = play_preview_btn_clone.clone();
+
+                        glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+                            let mut guard = play_child_clone.borrow_mut();
+                            if let Some(ref mut child) = *guard {
+                                match child.try_wait() {
+                                    Ok(Some(_)) => {
+                                        *guard = None;
+                                        btn_clone.set_label("Play Audio/Video");
+                                        btn_clone.set_icon_name("media-playback-start-symbolic");
+                                        glib::ControlFlow::Break
+                                    }
+                                    Ok(None) => glib::ControlFlow::Continue,
+                                    Err(_) => {
+                                        *guard = None;
+                                        btn_clone.set_label("Play Audio/Video");
+                                        btn_clone.set_icon_name("media-playback-start-symbolic");
+                                        glib::ControlFlow::Break
+                                    }
+                                }
+                            } else {
+                                glib::ControlFlow::Break
+                            }
+                        });
+                    }
+                    Err(_) => {
+                        let _ = Command::new("xdg-open").arg(vid_path).spawn();
+                    }
+                }
             }
         });
     }
@@ -618,7 +721,6 @@ fn build_ui(app: &Application) {
     actions_group.add(&actions_box);
 
     let details_container = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-    details_container.append(&video_preview_picture);
     details_container.append(&preview_picture);
     details_container.append(&file_group);
     details_container.append(&trim_group);
@@ -657,6 +759,18 @@ fn build_ui(app: &Application) {
         .default_height(680)
         .content(&toast_overlay)
         .build();
+
+    // Clean up preview child process on window close
+    {
+        let play_child = play_child.clone();
+        window.connect_close_request(move |_| {
+            if let Some(mut child) = play_child.borrow_mut().take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            glib::Propagation::Proceed
+        });
+    }
 
     // Connect preferences button
     {
@@ -802,7 +916,7 @@ fn build_ui(app: &Application) {
                     let pic = video_preview_picture.clone();
 
                     thread::spawn(move || {
-                        let temp_frame = env::temp_dir().join("quickcompress_preview.jpg");
+                        let temp_frame = get_next_preview_frame_path();
                         if video::extract_video_frame(&vid_path, 0.0, &temp_frame).is_ok() {
                             let _ = sender.send_blocking(temp_frame);
                         }
@@ -867,6 +981,8 @@ fn build_ui(app: &Application) {
         let preview_picture = preview_picture.clone();
         let video_preview_picture = video_preview_picture.clone();
         let current_video_path = current_video_path.clone();
+        let play_child = play_child.clone();
+        let play_preview_btn = play_preview_btn.clone();
         let trim_group = trim_group.clone();
         let open_folder_btn = open_folder_btn.clone();
         let clear_header_btn_clone = clear_header_btn.clone();
@@ -874,6 +990,12 @@ fn build_ui(app: &Application) {
         let do_clear = move || {
             current_files.borrow_mut().clear();
             *current_video_path.borrow_mut() = None;
+            if let Some(mut child) = play_child.borrow_mut().take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            play_preview_btn.set_label("Play Audio/Video");
+            play_preview_btn.set_icon_name("media-playback-start-symbolic");
             preview_picture.set_visible(false);
             video_preview_picture.set_visible(false);
             trim_group.set_visible(false);
