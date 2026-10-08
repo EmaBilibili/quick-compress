@@ -1,7 +1,10 @@
+mod video;
+
 use gtk4::gdk;
 use gtk4::gio;
+use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::Button;
+use gtk4::{Button, ProgressBar, Spinner};
 use libadwaita::prelude::*;
 use libadwaita::{
     ActionRow, Application, ApplicationWindow, HeaderBar, PreferencesGroup, StatusPage,
@@ -11,6 +14,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::thread;
 
 const APP_ID: &str = "io.github.EmaBilibili.QuickCompress";
 
@@ -43,7 +47,7 @@ fn is_supported_file(path: &Path) -> bool {
         let ext = ext.to_lowercase();
         matches!(
             ext.as_str(),
-            "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "mp4" | "mkv" | "mov" | "webm" | "mp3" | "wav" | "ogg"
+            "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "mp4" | "mkv" | "mov" | "webm" | "avi"
         )
     } else {
         false
@@ -75,7 +79,7 @@ fn build_ui(app: &Application) {
     let drop_status_page = StatusPage::builder()
         .icon_name("document-send-symbolic")
         .title("QuickCompress")
-        .description("Drag and drop images, video or audio files here\nor choose a file to compress")
+        .description("Drag and drop a video or image here\nor choose a file to compress")
         .build();
 
     let open_file_btn = Button::builder()
@@ -109,21 +113,38 @@ fn build_ui(app: &Application) {
     file_group.add(&file_row);
 
     let actions_group = PreferencesGroup::builder()
-        .title("Quick Actions")
+        .title("Quick Video Actions")
         .margin_start(24)
         .margin_end(24)
         .build();
 
-    let opt_chat_btn = Button::with_label("Compress for Chat (< 10 MB)");
-    opt_chat_btn.add_css_class("suggested-action");
+    let opt_discord_btn = Button::with_label("Target < 10 MB (Discord / WhatsApp)");
+    opt_discord_btn.add_css_class("suggested-action");
 
-    let opt_webp_btn = Button::with_label("Convert to WebP (High Efficiency)");
+    let opt_email_btn = Button::with_label("Target < 25 MB (Email / Telegram)");
+
+    // Progress bar and spinner
+    let spinner = Spinner::new();
+    spinner.set_halign(gtk4::Align::Center);
+    spinner.set_visible(false);
+
+    let progress_bar = ProgressBar::new();
+    progress_bar.set_pulse_step(0.1);
+    progress_bar.set_visible(false);
+
+    let status_label = gtk4::Label::new(None);
+    status_label.set_visible(false);
+    status_label.add_css_class("dim-label");
+
     let reset_btn = Button::with_label("Choose another file");
     reset_btn.add_css_class("flat");
 
-    let actions_box = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
-    actions_box.append(&opt_chat_btn);
-    actions_box.append(&opt_webp_btn);
+    let actions_box = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    actions_box.append(&opt_discord_btn);
+    actions_box.append(&opt_email_btn);
+    actions_box.append(&spinner);
+    actions_box.append(&progress_bar);
+    actions_box.append(&status_label);
     actions_box.append(&reset_btn);
     actions_group.add(&actions_box);
 
@@ -144,7 +165,7 @@ fn build_ui(app: &Application) {
         .application(app)
         .title("QuickCompress")
         .default_width(520)
-        .default_height(460)
+        .default_height(480)
         .content(&toast_overlay)
         .build();
 
@@ -156,6 +177,7 @@ fn build_ui(app: &Application) {
         let file_row = file_row.clone();
         let file_row_icon = file_row_icon.clone();
         let current_file = current_file.clone();
+        let actions_group = actions_group.clone();
         move |path: PathBuf| {
             if let Ok(metadata) = fs::metadata(&path) {
                 let name = path
@@ -173,6 +195,12 @@ fn build_ui(app: &Application) {
                 } else {
                     "image-x-generic-symbolic"
                 }));
+
+                actions_group.set_title(if is_video {
+                    "Quick Video Compression"
+                } else {
+                    "Image Actions"
+                });
 
                 *current_file.borrow_mut() = Some(FileInfo {
                     path,
@@ -241,18 +269,113 @@ fn build_ui(app: &Application) {
         });
     }
 
-    // Action Toast placeholders
-    {
+    // Helper for async video compression
+    let trigger_video_compression = {
+        let current_file = current_file.clone();
         let toast_overlay = toast_overlay.clone();
-        opt_chat_btn.connect_clicked(move |_| {
-            toast_overlay.add_toast(Toast::new("Compressing for chat... (Processing)"));
+        let opt_discord_btn = opt_discord_btn.clone();
+        let opt_email_btn = opt_email_btn.clone();
+        let spinner = spinner.clone();
+        let progress_bar = progress_bar.clone();
+        let status_label = status_label.clone();
+        let reset_btn = reset_btn.clone();
+
+        move |target_mb: f64| {
+            let file_opt = current_file.borrow().clone();
+            if let Some(info) = file_opt {
+                if !info.is_video {
+                    toast_overlay.add_toast(Toast::new("Selected file is not a video"));
+                    return;
+                }
+
+                // UI loading state
+                opt_discord_btn.set_sensitive(false);
+                opt_email_btn.set_sensitive(false);
+                reset_btn.set_sensitive(false);
+                spinner.set_visible(true);
+                spinner.start();
+                progress_bar.set_visible(true);
+                status_label.set_visible(true);
+                status_label.set_text(&format!("Compressing video to < {:.0} MB...", target_mb));
+
+                let out_suffix = format!("{:.0}mb", target_mb);
+                let out_path = video::generate_output_path(&info.path, &out_suffix, "mp4");
+
+                let (sender, receiver) = async_channel::bounded::<Result<PathBuf, String>>(1);
+
+                // Pulse timer
+                let pbar = progress_bar.clone();
+                let pulse_timer = glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                    pbar.pulse();
+                    glib::ControlFlow::Continue
+                });
+
+                // Spawn worker thread
+                let input_path = info.path.clone();
+                let output_path = out_path.clone();
+                thread::spawn(move || {
+                    let res = video::compress_video_target_mb(&input_path, &output_path, target_mb)
+                        .map(|_| output_path);
+                    let _ = sender.send_blocking(res);
+                });
+
+                // Spawn local async handler on main thread to update UI
+                let toast_overlay = toast_overlay.clone();
+                let opt_discord = opt_discord_btn.clone();
+                let opt_email = opt_email_btn.clone();
+                let reset = reset_btn.clone();
+                let spin = spinner.clone();
+                let pbar = progress_bar.clone();
+                let status_lbl = status_label.clone();
+
+                glib::MainContext::default().spawn_local(async move {
+                    if let Ok(res) = receiver.recv().await {
+                        pulse_timer.remove();
+                        spin.stop();
+                        spin.set_visible(false);
+                        pbar.set_visible(false);
+                        status_lbl.set_visible(false);
+                        opt_discord.set_sensitive(true);
+                        opt_email.set_sensitive(true);
+                        reset.set_sensitive(true);
+
+                        match res {
+                            Ok(saved_path) => {
+                                let size_str = fs::metadata(&saved_path)
+                                    .map(|m| format_bytes(m.len()))
+                                    .unwrap_or_default();
+                                let msg = format!(
+                                    "Saved: {} ({})",
+                                    saved_path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("video.mp4"),
+                                    size_str
+                                );
+                                toast_overlay.add_toast(Toast::new(&msg));
+                            }
+                            Err(err) => {
+                                toast_overlay.add_toast(Toast::new(&format!("Error: {}", err)));
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    };
+
+    // Connect compression buttons
+    {
+        let trigger = trigger_video_compression.clone();
+        opt_discord_btn.connect_clicked(move |_| {
+            trigger(9.5); // Discord 10 MB limit safe target
         });
     }
 
     {
-        let toast_overlay = toast_overlay.clone();
-        opt_webp_btn.connect_clicked(move |_| {
-            toast_overlay.add_toast(Toast::new("Converting to WebP... (Processing)"));
+        let trigger = trigger_video_compression;
+        opt_email_btn.connect_clicked(move |_| {
+            trigger(24.0); // 25 MB email/telegram safe target
         });
     }
 
