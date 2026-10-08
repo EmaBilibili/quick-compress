@@ -1,3 +1,4 @@
+mod desktop_integration;
 mod image_ops;
 mod updater;
 mod video;
@@ -295,6 +296,8 @@ fn prompt_update_dialog(parent: &ApplicationWindow, info: &updater::UpdateCheckR
 }
 
 fn main() {
+    desktop_integration::ensure_desktop_integration();
+
     let app = Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_ui);
     app.run();
