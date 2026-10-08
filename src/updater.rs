@@ -99,10 +99,14 @@ pub fn perform_self_update_and_restart(download_url: &str) -> Result<(), String>
         .map_err(|e| format!("Failed to download update: {}", e))?;
 
     let temp_exe = current_exe.with_extension("new_update");
-    let mut file = File::create(&temp_exe).map_err(|e| format!("Cannot create temp file: {}", e))?;
+    {
+        let mut file = File::create(&temp_exe).map_err(|e| format!("Cannot create temp file: {}", e))?;
 
-    io::copy(&mut resp.into_reader(), &mut file)
-        .map_err(|e| format!("Failed to write downloaded binary: {}", e))?;
+        io::copy(&mut resp.into_reader(), &mut file)
+            .map_err(|e| format!("Failed to write downloaded binary: {}", e))?;
+
+        file.sync_all().map_err(|e| format!("Failed to flush binary: {}", e))?;
+    }
 
     // Make executable (chmod +x)
     let mut perms = fs::metadata(&temp_exe)
