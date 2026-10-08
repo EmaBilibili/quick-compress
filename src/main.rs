@@ -1,3 +1,4 @@
+mod image_ops;
 mod video;
 
 use gtk4::gdk;
@@ -79,7 +80,7 @@ fn build_ui(app: &Application) {
     let drop_status_page = StatusPage::builder()
         .icon_name("document-send-symbolic")
         .title("QuickCompress")
-        .description("Drag and drop a video or image here\nor choose a file to compress")
+        .description("Drag and drop images, video or audio files here\nor choose a file to compress")
         .build();
 
     let open_file_btn = Button::builder()
@@ -112,16 +113,24 @@ fn build_ui(app: &Application) {
     file_row.add_prefix(&file_row_icon);
     file_group.add(&file_row);
 
+    // Actions Group
     let actions_group = PreferencesGroup::builder()
-        .title("Quick Video Actions")
+        .title("Actions")
         .margin_start(24)
         .margin_end(24)
         .build();
 
+    // Video Action Buttons
     let opt_discord_btn = Button::with_label("Target < 10 MB (Discord / WhatsApp)");
     opt_discord_btn.add_css_class("suggested-action");
 
     let opt_email_btn = Button::with_label("Target < 25 MB (Email / Telegram)");
+
+    // Image Action Buttons
+    let opt_webp_btn = Button::with_label("Convert to WebP (Lossless / High Efficiency)");
+    opt_webp_btn.add_css_class("suggested-action");
+
+    let opt_jpeg_chat_btn = Button::with_label("Compress JPEG (Max 1920px, 82% Quality)");
 
     // Progress bar and spinner
     let spinner = Spinner::new();
@@ -142,6 +151,8 @@ fn build_ui(app: &Application) {
     let actions_box = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     actions_box.append(&opt_discord_btn);
     actions_box.append(&opt_email_btn);
+    actions_box.append(&opt_webp_btn);
+    actions_box.append(&opt_jpeg_chat_btn);
     actions_box.append(&spinner);
     actions_box.append(&progress_bar);
     actions_box.append(&status_label);
@@ -178,6 +189,11 @@ fn build_ui(app: &Application) {
         let file_row_icon = file_row_icon.clone();
         let current_file = current_file.clone();
         let actions_group = actions_group.clone();
+        let opt_discord_btn = opt_discord_btn.clone();
+        let opt_email_btn = opt_email_btn.clone();
+        let opt_webp_btn = opt_webp_btn.clone();
+        let opt_jpeg_chat_btn = opt_jpeg_chat_btn.clone();
+
         move |path: PathBuf| {
             if let Ok(metadata) = fs::metadata(&path) {
                 let name = path
@@ -196,11 +212,20 @@ fn build_ui(app: &Application) {
                     "image-x-generic-symbolic"
                 }));
 
-                actions_group.set_title(if is_video {
-                    "Quick Video Compression"
+                // Adapt action buttons based on file type
+                if is_video {
+                    actions_group.set_title("Quick Video Compression");
+                    opt_discord_btn.set_visible(true);
+                    opt_email_btn.set_visible(true);
+                    opt_webp_btn.set_visible(false);
+                    opt_jpeg_chat_btn.set_visible(false);
                 } else {
-                    "Image Actions"
-                });
+                    actions_group.set_title("Quick Image Actions");
+                    opt_discord_btn.set_visible(false);
+                    opt_email_btn.set_visible(false);
+                    opt_webp_btn.set_visible(true);
+                    opt_jpeg_chat_btn.set_visible(true);
+                }
 
                 *current_file.borrow_mut() = Some(FileInfo {
                     path,
@@ -364,7 +389,123 @@ fn build_ui(app: &Application) {
         }
     };
 
-    // Connect compression buttons
+    // Helper for async image compression
+    let trigger_image_compression = {
+        let current_file = current_file.clone();
+        let toast_overlay = toast_overlay.clone();
+        let opt_webp_btn = opt_webp_btn.clone();
+        let opt_jpeg_chat_btn = opt_jpeg_chat_btn.clone();
+        let spinner = spinner.clone();
+        let progress_bar = progress_bar.clone();
+        let status_label = status_label.clone();
+        let reset_btn = reset_btn.clone();
+
+        move |is_webp: bool| {
+            let file_opt = current_file.borrow().clone();
+            if let Some(info) = file_opt {
+                if info.is_video {
+                    toast_overlay.add_toast(Toast::new("Selected file is not an image"));
+                    return;
+                }
+
+                // UI loading state
+                opt_webp_btn.set_sensitive(false);
+                opt_jpeg_chat_btn.set_sensitive(false);
+                reset_btn.set_sensitive(false);
+                spinner.set_visible(true);
+                spinner.start();
+                progress_bar.set_visible(true);
+                status_label.set_visible(true);
+                status_label.set_text(if is_webp {
+                    "Converting to WebP..."
+                } else {
+                    "Optimizing JPEG for chat..."
+                });
+
+                let (out_suffix, ext) = if is_webp {
+                    ("optimized", "webp")
+                } else {
+                    ("chat", "jpg")
+                };
+                let out_path = image_ops::generate_image_output_path(&info.path, out_suffix, ext);
+
+                let (sender, receiver) = async_channel::bounded::<Result<PathBuf, String>>(1);
+
+                // Pulse timer
+                let pbar = progress_bar.clone();
+                let pulse_timer = glib::timeout_add_local(std::time::Duration::from_millis(80), move || {
+                    pbar.pulse();
+                    glib::ControlFlow::Continue
+                });
+
+                // Spawn worker thread
+                let input_path = info.path.clone();
+                let output_path = out_path.clone();
+                thread::spawn(move || {
+                    let res = if is_webp {
+                        image_ops::convert_to_webp(&input_path, &output_path, false)
+                    } else {
+                        image_ops::optimize_jpeg(&input_path, &output_path, 1920)
+                    }
+                    .map(|_| output_path);
+
+                    let _ = sender.send_blocking(res);
+                });
+
+                // Spawn local async handler on main thread to update UI
+                let toast_overlay = toast_overlay.clone();
+                let opt_webp = opt_webp_btn.clone();
+                let opt_jpeg = opt_jpeg_chat_btn.clone();
+                let reset = reset_btn.clone();
+                let spin = spinner.clone();
+                let pbar = progress_bar.clone();
+                let status_lbl = status_label.clone();
+
+                glib::MainContext::default().spawn_local(async move {
+                    if let Ok(res) = receiver.recv().await {
+                        pulse_timer.remove();
+                        spin.stop();
+                        spin.set_visible(false);
+                        pbar.set_visible(false);
+                        status_lbl.set_visible(false);
+                        opt_webp.set_sensitive(true);
+                        opt_jpeg.set_sensitive(true);
+                        reset.set_sensitive(true);
+
+                        match res {
+                            Ok(saved_path) => {
+                                let orig_size = info.size_bytes;
+                                let new_size = fs::metadata(&saved_path)
+                                    .map(|m| m.len())
+                                    .unwrap_or(0);
+                                let saved_pct = if orig_size > new_size && orig_size > 0 {
+                                    ((orig_size - new_size) as f64 / orig_size as f64) * 100.0
+                                } else {
+                                    0.0
+                                };
+
+                                let msg = format!(
+                                    "Saved: {} ({}, -{:.0}%)",
+                                    saved_path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("image"),
+                                    format_bytes(new_size),
+                                    saved_pct
+                                );
+                                toast_overlay.add_toast(Toast::new(&msg));
+                            }
+                            Err(err) => {
+                                toast_overlay.add_toast(Toast::new(&format!("Error: {}", err)));
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    };
+
+    // Connect video compression buttons
     {
         let trigger = trigger_video_compression.clone();
         opt_discord_btn.connect_clicked(move |_| {
@@ -376,6 +517,21 @@ fn build_ui(app: &Application) {
         let trigger = trigger_video_compression;
         opt_email_btn.connect_clicked(move |_| {
             trigger(24.0); // 25 MB email/telegram safe target
+        });
+    }
+
+    // Connect image compression buttons
+    {
+        let trigger = trigger_image_compression.clone();
+        opt_webp_btn.connect_clicked(move |_| {
+            trigger(true);
+        });
+    }
+
+    {
+        let trigger = trigger_image_compression;
+        opt_jpeg_chat_btn.connect_clicked(move |_| {
+            trigger(false);
         });
     }
 
