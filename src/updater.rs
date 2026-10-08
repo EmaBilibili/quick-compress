@@ -35,12 +35,26 @@ pub struct UpdateCheckResult {
 
 /// Query GitHub API for the latest release
 pub fn check_for_updates() -> Result<UpdateCheckResult, String> {
-    let response: ReleaseInfo = ureq::get(REPO_API)
+    let response_result = ureq::get(REPO_API)
         .set("User-Agent", "QuickCompress-App")
-        .call()
-        .map_err(|e| format!("Failed to connect to GitHub: {}", e))?
-        .into_json()
-        .map_err(|e| format!("Failed to parse release info: {}", e))?;
+        .call();
+
+    let response: ReleaseInfo = match response_result {
+        Ok(resp) => resp
+            .into_json()
+            .map_err(|e| format!("Failed to parse release info: {}", e))?,
+        Err(ureq::Error::Status(404, _)) => {
+            // No releases published yet on the GitHub repository
+            return Ok(UpdateCheckResult {
+                has_update: false,
+                latest_version: CURRENT_VERSION.to_string(),
+                release_notes: "No releases published yet on GitHub.".to_string(),
+                download_url: None,
+                release_url: "https://github.com/EmaBilibili/quick-compress/releases".to_string(),
+            });
+        }
+        Err(e) => return Err(format!("Failed to connect to GitHub: {}", e)),
+    };
 
     let latest_tag = response.tag_name.trim_start_matches('v').to_string();
     let current = CURRENT_VERSION.trim_start_matches('v');
