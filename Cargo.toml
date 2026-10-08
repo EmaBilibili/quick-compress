@@ -10,3 +10,4 @@ repository = "https://github.com/EmaBilibili/quick-compress"
 [dependencies]
 libadwaita = { version = "0.7", features = ["v1_6"] }
 gtk4 = { version = "0.9", features = ["v4_16"] }
+image = "0.25"
