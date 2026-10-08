@@ -16,13 +16,22 @@ use libadwaita::{
 use std::cell::RefCell;
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 const APP_ID: &str = "io.github.EmaBilibili.QuickCompress";
+
+struct ActivePlayback {
+    audio_child: Option<Child>,
+    video_child: Option<Child>,
+    stop_flag: Arc<AtomicBool>,
+}
 
 #[derive(Clone)]
 struct FileItem {
@@ -450,8 +459,8 @@ fn build_ui(app: &Application) {
     trim_group.add(&timeline_box);
 
     let play_preview_btn = Button::builder()
-        .label("Play Audio/Video")
-        .tooltip_text("Preview video and hear audio with playback")
+        .label("Play")
+        .tooltip_text("Play or pause video directly in preview")
         .icon_name("media-playback-start-symbolic")
         .css_classes(["pill", "flat"])
         .build();
@@ -502,6 +511,8 @@ fn build_ui(app: &Application) {
     let video_duration_state: Rc<RefCell<f64>> = Rc::new(RefCell::new(0.0));
     let is_updating_scale = Rc::new(RefCell::new(false));
 
+    let active_playback: Rc<RefCell<Option<ActivePlayback>>> = Rc::new(RefCell::new(None));
+
     // When user drags timeline slider, extract and show the frame at that timestamp
     {
         let video_preview_picture = video_preview_picture.clone();
@@ -509,11 +520,29 @@ fn build_ui(app: &Application) {
         let time_pos_label = time_pos_label.clone();
         let is_updating_scale = is_updating_scale.clone();
         let duration_state = video_duration_state.clone();
+        let active_playback = active_playback.clone();
+        let play_preview_btn_for_scale = play_preview_btn.clone();
 
         timeline_scale.connect_value_changed(move |scale| {
             if *is_updating_scale.borrow() {
                 return;
             }
+
+            // Stop any ongoing playback when manually dragging slider
+            if let Some(mut active) = active_playback.borrow_mut().take() {
+                active.stop_flag.store(true, Ordering::SeqCst);
+                if let Some(mut child) = active.audio_child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                if let Some(mut child) = active.video_child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                play_preview_btn_for_scale.set_label("Play");
+                play_preview_btn_for_scale.set_icon_name("media-playback-start-symbolic");
+            }
+
             let target_sec = scale.value();
             let total_dur = *duration_state.borrow();
             time_pos_label.set_text(&format!(
@@ -543,87 +572,209 @@ fn build_ui(app: &Application) {
         });
     }
 
-    let play_child: Rc<RefCell<Option<Child>>> = Rc::new(RefCell::new(None));
-
-    // Play/Stop preview with audio and video window (via ffplay with autoexit)
+    // Play/Pause embedded video and audio directly in previewer
     {
         let current_video_path = current_video_path.clone();
-        let play_child = play_child.clone();
+        let active_playback = active_playback.clone();
         let play_preview_btn_clone = play_preview_btn.clone();
         let timeline_scale = timeline_scale.clone();
         let trim_start_entry = trim_start_entry.clone();
         let trim_end_entry = trim_end_entry.clone();
+        let video_preview_picture = video_preview_picture.clone();
+        let time_pos_label = time_pos_label.clone();
+        let video_duration_state = video_duration_state.clone();
+        let is_updating_scale = is_updating_scale.clone();
 
         play_preview_btn.connect_clicked(move |_| {
-            let mut child_guard = play_child.borrow_mut();
-            if let Some(mut child) = child_guard.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-                play_preview_btn_clone.set_label("Play Audio/Video");
+            // If already playing, pause / stop it
+            if let Some(mut active) = active_playback.borrow_mut().take() {
+                active.stop_flag.store(true, Ordering::SeqCst);
+                if let Some(mut child) = active.audio_child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                if let Some(mut child) = active.video_child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                play_preview_btn_clone.set_label("Play");
                 play_preview_btn_clone.set_icon_name("media-playback-start-symbolic");
                 return;
             }
 
-            if let Some(vid_path) = current_video_path.borrow().as_ref() {
+            if let Some(vid_path) = current_video_path.borrow().clone() {
                 let current_slider = timeline_scale.value();
-                let start_val = parse_time_str(&trim_start_entry.text()).unwrap_or(current_slider);
-                let end_val = parse_time_str(&trim_end_entry.text());
+                let trim_start_val = parse_time_str(&trim_start_entry.text());
+                let trim_end_val = parse_time_str(&trim_end_entry.text());
 
-                let mut cmd = Command::new("ffplay");
-                cmd.args([
-                    "-window_title",
-                    "QuickCompress - Audio/Video Preview",
-                    "-x",
-                    "720",
+                let mut start_val = trim_start_val.unwrap_or(current_slider);
+                if let Some(end) = trim_end_val {
+                    if current_slider >= end {
+                        start_val = trim_start_val.unwrap_or(0.0);
+                    } else if current_slider > start_val {
+                        start_val = current_slider;
+                    }
+                } else if current_slider > start_val {
+                    start_val = current_slider;
+                }
+
+                let duration_opt = trim_end_val.filter(|&end| end > start_val).map(|end| end - start_val);
+
+                // Invisible background ffplay for audio
+                let mut audio_cmd = Command::new("ffplay");
+                audio_cmd.args([
+                    "-nodisp",
+                    "-autoexit",
                     "-ss",
                     &format!("{:.2}", start_val),
                 ]);
-
-                if let Some(end) = end_val {
-                    if end > start_val {
-                        cmd.args(["-t", &format!("{:.2}", end - start_val)]);
-                    }
+                if let Some(dur) = duration_opt {
+                    audio_cmd.args(["-t", &format!("{:.2}", dur)]);
                 }
+                audio_cmd.arg(&vid_path);
+                audio_cmd.stdout(Stdio::null());
+                audio_cmd.stderr(Stdio::null());
+                let audio_child = audio_cmd.spawn().ok();
 
-                cmd.arg(vid_path);
-                cmd.arg("-autoexit");
+                // Video stream decoder piping MJPEG frames directly to the GTK Picture
+                let mut video_cmd = Command::new("ffmpeg");
+                video_cmd.args([
+                    "-ss",
+                    &format!("{:.2}", start_val),
+                    "-i",
+                ]);
+                video_cmd.arg(&vid_path);
+                if let Some(dur) = duration_opt {
+                    video_cmd.args(["-t", &format!("{:.2}", dur)]);
+                }
+                video_cmd.args([
+                    "-vf",
+                    "scale='min(640,iw)':-2,fps=24",
+                    "-c:v",
+                    "mjpeg",
+                    "-f",
+                    "image2pipe",
+                    "pipe:1",
+                ]);
+                video_cmd.stdout(Stdio::piped());
+                video_cmd.stderr(Stdio::null());
 
-                match cmd.spawn() {
-                    Ok(proc) => {
-                        *child_guard = Some(proc);
-                        play_preview_btn_clone.set_label("Stop Playing");
-                        play_preview_btn_clone.set_icon_name("media-playback-stop-symbolic");
+                let mut video_child = match video_cmd.spawn() {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                let mut stdout = match video_child.stdout.take() {
+                    Some(s) => s,
+                    None => return,
+                };
 
-                        let play_child_clone = play_child.clone();
-                        let btn_clone = play_preview_btn_clone.clone();
+                let stop_flag = Arc::new(AtomicBool::new(false));
+                let stop_flag_clone = stop_flag.clone();
+                let (frame_sender, frame_receiver) = async_channel::bounded::<(Vec<u8>, f64)>(4);
 
-                        glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
-                            let mut guard = play_child_clone.borrow_mut();
-                            if let Some(ref mut child) = *guard {
-                                match child.try_wait() {
-                                    Ok(Some(_)) => {
-                                        *guard = None;
-                                        btn_clone.set_label("Play Audio/Video");
-                                        btn_clone.set_icon_name("media-playback-start-symbolic");
-                                        glib::ControlFlow::Break
-                                    }
-                                    Ok(None) => glib::ControlFlow::Continue,
-                                    Err(_) => {
-                                        *guard = None;
-                                        btn_clone.set_label("Play Audio/Video");
-                                        btn_clone.set_icon_name("media-playback-start-symbolic");
-                                        glib::ControlFlow::Break
-                                    }
+                thread::spawn(move || {
+                    let frame_interval = Duration::from_micros(1_000_000 / 24);
+                    let start_instant = Instant::now();
+                    let mut frame_count: u64 = 0;
+                    let mut buf = Vec::with_capacity(64 * 1024);
+                    let mut chunk = [0u8; 8192];
+
+                    while !stop_flag_clone.load(Ordering::Relaxed) {
+                        let n = match stdout.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+                        buf.extend_from_slice(&chunk[..n]);
+
+                        while buf.len() >= 4 {
+                            let soi = match buf.windows(2).position(|w| w == [0xFF, 0xD8]) {
+                                Some(pos) => pos,
+                                None => {
+                                    buf.clear();
+                                    break;
                                 }
-                            } else {
-                                glib::ControlFlow::Break
+                            };
+
+                            let eoi = match buf[soi + 2..].windows(2).position(|w| w == [0xFF, 0xD9]) {
+                                Some(pos) => soi + 2 + pos + 2,
+                                None => {
+                                    if soi > 0 {
+                                        buf.drain(..soi);
+                                    }
+                                    break;
+                                }
+                            };
+
+                            let frame_bytes = buf[soi..eoi].to_vec();
+                            buf.drain(..eoi);
+
+                            frame_count += 1;
+                            let current_pts = start_val + (frame_count as f64 / 24.0);
+                            let target_time = start_instant + frame_interval * frame_count as u32;
+                            let now = Instant::now();
+                            if target_time > now {
+                                thread::sleep(target_time - now);
                             }
-                        });
+
+                            if frame_sender.send_blocking((frame_bytes, current_pts)).is_err() {
+                                return;
+                            }
+                        }
                     }
-                    Err(_) => {
-                        let _ = Command::new("xdg-open").arg(vid_path).spawn();
+                });
+
+                let pic = video_preview_picture.clone();
+                let scale = timeline_scale.clone();
+                let label = time_pos_label.clone();
+                let total_dur = *video_duration_state.borrow();
+                let is_updating = is_updating_scale.clone();
+                let btn = play_preview_btn_clone.clone();
+                let active_playback_for_recv = active_playback.clone();
+
+                glib::MainContext::default().spawn_local(async move {
+                    while let Ok((bytes, current_pts)) = frame_receiver.recv().await {
+                        let glib_bytes = glib::Bytes::from(&bytes);
+                        if let Ok(texture) = gtk4::gdk::Texture::from_bytes(&glib_bytes) {
+                            pic.set_paintable(Some(&texture));
+                            pic.set_visible(true);
+                        }
+
+                        *is_updating.borrow_mut() = true;
+                        let clamped_pts = current_pts.min(total_dur);
+                        scale.set_value(clamped_pts);
+                        label.set_text(&format!(
+                            "{} / {}",
+                            format_time_display(clamped_pts),
+                            format_time_display(total_dur)
+                        ));
+                        *is_updating.borrow_mut() = false;
                     }
-                }
+
+                    // Playback reached end
+                    if let Some(mut active) = active_playback_for_recv.borrow_mut().take() {
+                        active.stop_flag.store(true, Ordering::SeqCst);
+                        if let Some(mut child) = active.audio_child.take() {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                        if let Some(mut child) = active.video_child.take() {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                        btn.set_label("Play");
+                        btn.set_icon_name("media-playback-start-symbolic");
+                    }
+                });
+
+                *active_playback.borrow_mut() = Some(ActivePlayback {
+                    audio_child,
+                    video_child: Some(video_child),
+                    stop_flag,
+                });
+
+                play_preview_btn_clone.set_label("Pause");
+                play_preview_btn_clone.set_icon_name("media-playback-pause-symbolic");
             }
         });
     }
@@ -760,13 +911,20 @@ fn build_ui(app: &Application) {
         .content(&toast_overlay)
         .build();
 
-    // Clean up preview child process on window close
+    // Clean up preview child processes on window close
     {
-        let play_child = play_child.clone();
+        let active_playback = active_playback.clone();
         window.connect_close_request(move |_| {
-            if let Some(mut child) = play_child.borrow_mut().take() {
-                let _ = child.kill();
-                let _ = child.wait();
+            if let Some(mut active) = active_playback.borrow_mut().take() {
+                active.stop_flag.store(true, Ordering::SeqCst);
+                if let Some(mut child) = active.audio_child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                if let Some(mut child) = active.video_child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
             }
             glib::Propagation::Proceed
         });
@@ -980,8 +1138,7 @@ fn build_ui(app: &Application) {
         let current_files = current_files.clone();
         let preview_picture = preview_picture.clone();
         let video_preview_picture = video_preview_picture.clone();
-        let current_video_path = current_video_path.clone();
-        let play_child = play_child.clone();
+        let active_playback = active_playback.clone();
         let play_preview_btn = play_preview_btn.clone();
         let trim_group = trim_group.clone();
         let open_folder_btn = open_folder_btn.clone();
@@ -990,11 +1147,18 @@ fn build_ui(app: &Application) {
         let do_clear = move || {
             current_files.borrow_mut().clear();
             *current_video_path.borrow_mut() = None;
-            if let Some(mut child) = play_child.borrow_mut().take() {
-                let _ = child.kill();
-                let _ = child.wait();
+            if let Some(mut active) = active_playback.borrow_mut().take() {
+                active.stop_flag.store(true, Ordering::SeqCst);
+                if let Some(mut child) = active.audio_child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                if let Some(mut child) = active.video_child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
             }
-            play_preview_btn.set_label("Play Audio/Video");
+            play_preview_btn.set_label("Play");
             play_preview_btn.set_icon_name("media-playback-start-symbolic");
             preview_picture.set_visible(false);
             video_preview_picture.set_visible(false);

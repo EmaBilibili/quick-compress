@@ -1379,7 +1379,7 @@ dependencies = [
 
 [[package]]
 name = "quick-compress"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-channel",
  "gtk4",
