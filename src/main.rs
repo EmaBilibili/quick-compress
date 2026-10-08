@@ -7,10 +7,10 @@ use gtk4::gdk;
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::{Button, Entry, EventControllerKey, Label, MediaFile, Picture, ProgressBar, Scale, ScrolledWindow, Spinner, Video};
+use gtk4::{Button, Entry, EventControllerKey, Label, Picture, ProgressBar, Scale, ScrolledWindow, Spinner};
 use libadwaita::prelude::*;
 use libadwaita::{
-    ActionRow, Application, ApplicationWindow, HeaderBar, MessageDialog, PreferencesGroup,
+    ActionRow, Application, ApplicationWindow, Clamp, HeaderBar, MessageDialog, PreferencesGroup,
     PreferencesPage, PreferencesWindow, StatusPage, Toast, ToastOverlay, ViewStack,
 };
 use std::cell::RefCell;
@@ -392,19 +392,18 @@ fn build_ui(app: &Application) {
     file_group.add(&file_row);
 
     // Video Player & Trimming Group (Hidden for images)
-    let video_player = Video::builder()
-        .autoplay(false)
-        .loop_(false)
-        .height_request(220)
-        .margin_start(24)
-        .margin_end(24)
+    let video_preview_picture = Picture::builder()
+        .can_shrink(true)
+        .content_fit(gtk4::ContentFit::Contain)
+        .height_request(240)
         .margin_top(8)
+        .margin_bottom(8)
         .visible(false)
         .build();
 
     let trim_group = PreferencesGroup::builder()
-        .title("Video Preview & Trim")
-        .description("Play/pause to find moments, drag the timeline, or set Start & End marks")
+        .title("Video Frame Preview & Trim")
+        .description("Drag the slider to scrub through the video frames, or preview playback with external player")
         .margin_start(24)
         .margin_end(24)
         .visible(false)
@@ -422,6 +421,12 @@ fn build_ui(app: &Application) {
     timeline_box.append(&timeline_scale);
     timeline_box.append(&time_pos_label);
     trim_group.add(&timeline_box);
+
+    let play_preview_btn = Button::builder()
+        .label("Play Full Video")
+        .icon_name("media-playback-start-symbolic")
+        .css_classes(["pill", "flat"])
+        .build();
 
     let set_start_btn = Button::builder()
         .label("Set as Start")
@@ -443,6 +448,7 @@ fn build_ui(app: &Application) {
 
     let trim_buttons_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     trim_buttons_box.set_halign(gtk4::Align::Center);
+    trim_buttons_box.append(&play_preview_btn);
     trim_buttons_box.append(&set_start_btn);
     trim_buttons_box.append(&set_end_btn);
     trim_buttons_box.append(&clear_trim_btn);
@@ -464,21 +470,57 @@ fn build_ui(app: &Application) {
     trim_box.append(&trim_end_entry);
     trim_group.add(&trim_box);
 
+    let current_video_path: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
     let video_duration_state: Rc<RefCell<f64>> = Rc::new(RefCell::new(0.0));
     let is_updating_scale = Rc::new(RefCell::new(false));
 
-    // When user drags timeline slider, seek video to that position
+    // When user drags timeline slider, extract and show the frame at that timestamp
     {
-        let video_player = video_player.clone();
+        let video_preview_picture = video_preview_picture.clone();
+        let current_video_path = current_video_path.clone();
+        let time_pos_label = time_pos_label.clone();
         let is_updating_scale = is_updating_scale.clone();
+        let duration_state = video_duration_state.clone();
+
         timeline_scale.connect_value_changed(move |scale| {
             if *is_updating_scale.borrow() {
                 return;
             }
-            if let Some(stream) = video_player.media_stream() {
-                let target_sec = scale.value();
-                let micros = (target_sec * 1_000_000.0) as i64;
-                stream.seek(micros);
+            let target_sec = scale.value();
+            let total_dur = *duration_state.borrow();
+            time_pos_label.set_text(&format!(
+                "{} / {}",
+                format_time_display(target_sec),
+                format_time_display(total_dur)
+            ));
+
+            if let Some(vid_path) = current_video_path.borrow().clone() {
+                let temp_frame = env::temp_dir().join("quickcompress_preview.jpg");
+                let (sender, receiver) = async_channel::bounded::<PathBuf>(1);
+                let pic = video_preview_picture.clone();
+
+                thread::spawn(move || {
+                    if video::extract_video_frame(&vid_path, target_sec, &temp_frame).is_ok() {
+                        let _ = sender.send_blocking(temp_frame);
+                    }
+                });
+
+                glib::MainContext::default().spawn_local(async move {
+                    if let Ok(frame_path) = receiver.recv().await {
+                        pic.set_filename(Some(&frame_path));
+                        pic.set_visible(true);
+                    }
+                });
+            }
+        });
+    }
+
+    // Play preview in default video player (e.g. mpv, vlc, totem, kaffeine)
+    {
+        let current_video_path = current_video_path.clone();
+        play_preview_btn.connect_clicked(move |_| {
+            if let Some(vid_path) = current_video_path.borrow().as_ref() {
+                let _ = Command::new("xdg-open").arg(vid_path).spawn();
             }
         });
     }
@@ -576,23 +618,34 @@ fn build_ui(app: &Application) {
     actions_group.add(&actions_box);
 
     let details_container = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
-    details_container.append(&video_player);
+    details_container.append(&video_preview_picture);
     details_container.append(&preview_picture);
     details_container.append(&file_group);
     details_container.append(&trim_group);
     details_container.append(&actions_group);
 
-    let scrolled_details = ScrolledWindow::builder()
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .vscrollbar_policy(gtk4::PolicyType::Automatic)
+    let clamp = Clamp::builder()
+        .maximum_size(680)
+        .tightening_threshold(540)
         .child(&details_container)
         .build();
 
+    let scrolled_details = ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vscrollbar_policy(gtk4::PolicyType::Automatic)
+        .vexpand(true)
+        .hexpand(true)
+        .child(&clamp)
+        .build();
+
+    view_stack.set_vexpand(true);
+    view_stack.set_hexpand(true);
     view_stack.add_titled(&scrolled_details, Some("actions"), "Actions");
     view_stack.set_visible_child_name("drop");
 
     // Layout
     let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    content_box.set_vexpand(true);
     content_box.append(&header_bar);
     content_box.append(&view_stack);
     toast_overlay.set_child(Some(&content_box));
@@ -665,13 +718,13 @@ fn build_ui(app: &Application) {
         let opt_strip_exif_btn = opt_strip_exif_btn.clone();
         let open_folder_btn = open_folder_btn.clone();
         let clear_header_btn = clear_header_btn.clone();
-        let video_player = video_player.clone();
+        let video_preview_picture = video_preview_picture.clone();
         let timeline_scale = timeline_scale.clone();
         let time_pos_label = time_pos_label.clone();
         let trim_start_entry = trim_start_entry.clone();
         let trim_end_entry = trim_end_entry.clone();
         let video_duration_state = video_duration_state.clone();
-        let is_updating_scale = is_updating_scale.clone();
+        let current_video_path = current_video_path.clone();
 
         move |paths: Vec<PathBuf>| {
             let mut items = Vec::new();
@@ -721,14 +774,15 @@ fn build_ui(app: &Application) {
                     "image-x-generic-symbolic"
                 }));
 
-                // Load thumbnail if it's an image, or load video in player
+                // Load thumbnail if it's an image, or setup video scrubber
                 if !first.is_video {
-                    video_player.set_media_stream(None::<&gtk4::MediaStream>);
-                    video_player.set_visible(false);
+                    *current_video_path.borrow_mut() = None;
+                    video_preview_picture.set_visible(false);
                     preview_picture.set_filename(Some(&first.path));
                     preview_picture.set_visible(true);
                     trim_group.set_visible(false);
                 } else {
+                    *current_video_path.borrow_mut() = Some(first.path.clone());
                     preview_picture.set_visible(false);
                     trim_group.set_visible(true);
                     trim_start_entry.set_text("");
@@ -738,46 +792,36 @@ fn build_ui(app: &Application) {
                     let probed_duration = video::probe_video_duration(&first.path).unwrap_or(0.0);
                     *video_duration_state.borrow_mut() = probed_duration;
 
-                    let file = gio::File::for_path(&first.path);
-                    let media_file = MediaFile::for_file(&file);
-                    video_player.set_media_stream(Some(&media_file));
-                    video_player.set_visible(true);
-
                     timeline_scale.set_range(0.0, probed_duration.max(1.0));
                     timeline_scale.set_value(0.0);
                     time_pos_label.set_text(&format!("00:00 / {}", format_time_display(probed_duration)));
 
-                    let time_pos_label_clone = time_pos_label.clone();
-                    let timeline_scale_clone = timeline_scale.clone();
-                    let is_updating_scale_clone = is_updating_scale.clone();
-                    let dur_clone = probed_duration;
+                    // Extract initial frame for instant visual preview
+                    let vid_path = first.path.clone();
+                    let (sender, receiver) = async_channel::bounded::<PathBuf>(1);
+                    let pic = video_preview_picture.clone();
 
-                    media_file.connect_timestamp_notify(move |stream| {
-                        let current_sec = stream.timestamp() as f64 / 1_000_000.0;
-                        let total_sec = if dur_clone > 0.0 {
-                            dur_clone
-                        } else {
-                            stream.duration() as f64 / 1_000_000.0
-                        };
+                    thread::spawn(move || {
+                        let temp_frame = env::temp_dir().join("quickcompress_preview.jpg");
+                        if video::extract_video_frame(&vid_path, 0.0, &temp_frame).is_ok() {
+                            let _ = sender.send_blocking(temp_frame);
+                        }
+                    });
 
-                        time_pos_label_clone.set_text(&format!(
-                            "{} / {}",
-                            format_time_display(current_sec),
-                            format_time_display(total_sec)
-                        ));
-
-                        *is_updating_scale_clone.borrow_mut() = true;
-                        timeline_scale_clone.set_value(current_sec);
-                        *is_updating_scale_clone.borrow_mut() = false;
+                    glib::MainContext::default().spawn_local(async move {
+                        if let Ok(frame_path) = receiver.recv().await {
+                            pic.set_filename(Some(&frame_path));
+                            pic.set_visible(true);
+                        }
                     });
                 }
             } else {
+                *current_video_path.borrow_mut() = None;
                 file_row.set_title(&format!("{} files selected", items.len()));
                 file_row.set_subtitle(&format!("Total size: {}", format_bytes(total_size)));
                 file_row_icon.set_icon_name(Some("emblem-documents-symbolic"));
                 preview_picture.set_visible(false);
-                video_player.set_media_stream(None::<&gtk4::MediaStream>);
-                video_player.set_visible(false);
+                video_preview_picture.set_visible(false);
                 trim_group.set_visible(false);
             }
 
@@ -821,16 +865,17 @@ fn build_ui(app: &Application) {
         let view_stack = view_stack.clone();
         let current_files = current_files.clone();
         let preview_picture = preview_picture.clone();
-        let video_player = video_player.clone();
+        let video_preview_picture = video_preview_picture.clone();
+        let current_video_path = current_video_path.clone();
         let trim_group = trim_group.clone();
         let open_folder_btn = open_folder_btn.clone();
         let clear_header_btn_clone = clear_header_btn.clone();
 
         let do_clear = move || {
             current_files.borrow_mut().clear();
+            *current_video_path.borrow_mut() = None;
             preview_picture.set_visible(false);
-            video_player.set_media_stream(None::<&gtk4::MediaStream>);
-            video_player.set_visible(false);
+            video_preview_picture.set_visible(false);
             trim_group.set_visible(false);
             open_folder_btn.set_visible(false);
             clear_header_btn_clone.set_visible(false);

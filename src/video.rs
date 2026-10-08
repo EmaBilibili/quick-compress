@@ -28,6 +28,35 @@ pub fn probe_video_duration(input: &Path) -> Result<f64, String> {
     Ok(duration)
 }
 
+/// Extract a single frame at seconds timestamp to a destination image file
+pub fn extract_video_frame(input: &Path, seconds: f64, output: &Path) -> Result<(), String> {
+    let output_cmd = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-ss",
+            &format!("{:.2}", seconds.max(0.0)),
+            "-i",
+        ])
+        .arg(input)
+        .args([
+            "-vframes",
+            "1",
+            "-q:v",
+            "2",
+            "-update",
+            "1",
+        ])
+        .arg(output)
+        .output()
+        .map_err(|e| format!("Failed to run ffmpeg frame extraction: {}", e))?;
+
+    if !output_cmd.status.success() {
+        return Err("Failed to extract preview frame from video".to_string());
+    }
+
+    Ok(())
+}
+
 pub fn compress_video_target_mb(
     input: &Path,
     output: &Path,
