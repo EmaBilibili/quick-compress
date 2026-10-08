@@ -127,10 +127,12 @@ fn build_ui(app: &Application) {
     let opt_email_btn = Button::with_label("Target < 25 MB (Email / Telegram)");
 
     // Image Action Buttons
-    let opt_webp_btn = Button::with_label("Convert to WebP (Lossless / High Efficiency)");
-    opt_webp_btn.add_css_class("suggested-action");
+    let opt_webp_lossy_btn = Button::with_label("Convert to WebP (Optimized / Lossy ~78%)");
+    opt_webp_lossy_btn.add_css_class("suggested-action");
 
-    let opt_jpeg_chat_btn = Button::with_label("Compress JPEG (Max 1920px, 82% Quality)");
+    let opt_webp_lossless_btn = Button::with_label("Convert to WebP (Lossless for PNGs/Art)");
+
+    let opt_jpeg_chat_btn = Button::with_label("Compress JPEG (Max 1920px, 80% Quality)");
 
     // Progress bar and spinner
     let spinner = Spinner::new();
@@ -151,7 +153,8 @@ fn build_ui(app: &Application) {
     let actions_box = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
     actions_box.append(&opt_discord_btn);
     actions_box.append(&opt_email_btn);
-    actions_box.append(&opt_webp_btn);
+    actions_box.append(&opt_webp_lossy_btn);
+    actions_box.append(&opt_webp_lossless_btn);
     actions_box.append(&opt_jpeg_chat_btn);
     actions_box.append(&spinner);
     actions_box.append(&progress_bar);
@@ -191,7 +194,8 @@ fn build_ui(app: &Application) {
         let actions_group = actions_group.clone();
         let opt_discord_btn = opt_discord_btn.clone();
         let opt_email_btn = opt_email_btn.clone();
-        let opt_webp_btn = opt_webp_btn.clone();
+        let opt_webp_lossy_btn = opt_webp_lossy_btn.clone();
+        let opt_webp_lossless_btn = opt_webp_lossless_btn.clone();
         let opt_jpeg_chat_btn = opt_jpeg_chat_btn.clone();
 
         move |path: PathBuf| {
@@ -217,13 +221,15 @@ fn build_ui(app: &Application) {
                     actions_group.set_title("Quick Video Compression");
                     opt_discord_btn.set_visible(true);
                     opt_email_btn.set_visible(true);
-                    opt_webp_btn.set_visible(false);
+                    opt_webp_lossy_btn.set_visible(false);
+                    opt_webp_lossless_btn.set_visible(false);
                     opt_jpeg_chat_btn.set_visible(false);
                 } else {
                     actions_group.set_title("Quick Image Actions");
                     opt_discord_btn.set_visible(false);
                     opt_email_btn.set_visible(false);
-                    opt_webp_btn.set_visible(true);
+                    opt_webp_lossy_btn.set_visible(true);
+                    opt_webp_lossless_btn.set_visible(true);
                     opt_jpeg_chat_btn.set_visible(true);
                 }
 
@@ -393,14 +399,16 @@ fn build_ui(app: &Application) {
     let trigger_image_compression = {
         let current_file = current_file.clone();
         let toast_overlay = toast_overlay.clone();
-        let opt_webp_btn = opt_webp_btn.clone();
+        let opt_webp_lossy_btn = opt_webp_lossy_btn.clone();
+        let opt_webp_lossless_btn = opt_webp_lossless_btn.clone();
         let opt_jpeg_chat_btn = opt_jpeg_chat_btn.clone();
         let spinner = spinner.clone();
         let progress_bar = progress_bar.clone();
         let status_label = status_label.clone();
         let reset_btn = reset_btn.clone();
 
-        move |is_webp: bool| {
+        // mode: 0 = WebP Lossy (Optimized), 1 = WebP Lossless, 2 = JPEG Chat
+        move |mode: u8| {
             let file_opt = current_file.borrow().clone();
             if let Some(info) = file_opt {
                 if info.is_video {
@@ -409,23 +417,24 @@ fn build_ui(app: &Application) {
                 }
 
                 // UI loading state
-                opt_webp_btn.set_sensitive(false);
+                opt_webp_lossy_btn.set_sensitive(false);
+                opt_webp_lossless_btn.set_sensitive(false);
                 opt_jpeg_chat_btn.set_sensitive(false);
                 reset_btn.set_sensitive(false);
                 spinner.set_visible(true);
                 spinner.start();
                 progress_bar.set_visible(true);
                 status_label.set_visible(true);
-                status_label.set_text(if is_webp {
-                    "Converting to WebP..."
-                } else {
-                    "Optimizing JPEG for chat..."
+                status_label.set_text(match mode {
+                    0 => "Optimizing to WebP (Lossy ~78%)...",
+                    1 => "Converting to WebP (Lossless)...",
+                    _ => "Compressing JPEG for chat...",
                 });
 
-                let (out_suffix, ext) = if is_webp {
-                    ("optimized", "webp")
-                } else {
-                    ("chat", "jpg")
+                let (out_suffix, ext) = match mode {
+                    0 => ("optimized", "webp"),
+                    1 => ("lossless", "webp"),
+                    _ => ("chat", "jpg"),
                 };
                 let out_path = image_ops::generate_image_output_path(&info.path, out_suffix, ext);
 
@@ -442,10 +451,10 @@ fn build_ui(app: &Application) {
                 let input_path = info.path.clone();
                 let output_path = out_path.clone();
                 thread::spawn(move || {
-                    let res = if is_webp {
-                        image_ops::convert_to_webp(&input_path, &output_path, false)
-                    } else {
-                        image_ops::optimize_jpeg(&input_path, &output_path, 1920)
+                    let res = match mode {
+                        0 => image_ops::convert_to_webp(&input_path, &output_path, false),
+                        1 => image_ops::convert_to_webp(&input_path, &output_path, true),
+                        _ => image_ops::optimize_jpeg(&input_path, &output_path, 1920),
                     }
                     .map(|_| output_path);
 
@@ -454,7 +463,8 @@ fn build_ui(app: &Application) {
 
                 // Spawn local async handler on main thread to update UI
                 let toast_overlay = toast_overlay.clone();
-                let opt_webp = opt_webp_btn.clone();
+                let opt_webp_lossy = opt_webp_lossy_btn.clone();
+                let opt_webp_lossless = opt_webp_lossless_btn.clone();
                 let opt_jpeg = opt_jpeg_chat_btn.clone();
                 let reset = reset_btn.clone();
                 let spin = spinner.clone();
@@ -468,7 +478,8 @@ fn build_ui(app: &Application) {
                         spin.set_visible(false);
                         pbar.set_visible(false);
                         status_lbl.set_visible(false);
-                        opt_webp.set_sensitive(true);
+                        opt_webp_lossy.set_sensitive(true);
+                        opt_webp_lossless.set_sensitive(true);
                         opt_jpeg.set_sensitive(true);
                         reset.set_sensitive(true);
 
@@ -484,15 +495,26 @@ fn build_ui(app: &Application) {
                                     0.0
                                 };
 
-                                let msg = format!(
-                                    "Saved: {} ({}, -{:.0}%)",
-                                    saved_path
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or("image"),
-                                    format_bytes(new_size),
-                                    saved_pct
-                                );
+                                let msg = if saved_pct > 0.0 {
+                                    format!(
+                                        "Saved: {} ({}, -{:.0}%)",
+                                        saved_path
+                                            .file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or("image"),
+                                        format_bytes(new_size),
+                                        saved_pct
+                                    )
+                                } else {
+                                    format!(
+                                        "Saved: {} ({})",
+                                        saved_path
+                                            .file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or("image"),
+                                        format_bytes(new_size)
+                                    )
+                                };
                                 toast_overlay.add_toast(Toast::new(&msg));
                             }
                             Err(err) => {
@@ -523,15 +545,22 @@ fn build_ui(app: &Application) {
     // Connect image compression buttons
     {
         let trigger = trigger_image_compression.clone();
-        opt_webp_btn.connect_clicked(move |_| {
-            trigger(true);
+        opt_webp_lossy_btn.connect_clicked(move |_| {
+            trigger(0); // WebP Lossy (Optimized)
+        });
+    }
+
+    {
+        let trigger = trigger_image_compression.clone();
+        opt_webp_lossless_btn.connect_clicked(move |_| {
+            trigger(1); // WebP Lossless
         });
     }
 
     {
         let trigger = trigger_image_compression;
         opt_jpeg_chat_btn.connect_clicked(move |_| {
-            trigger(false);
+            trigger(2); // JPEG Chat
         });
     }
 

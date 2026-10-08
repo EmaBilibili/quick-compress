@@ -2,29 +2,43 @@ use image::ImageReader;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
+/// Convert to WebP using FFmpeg libwebp encoder for true lossy / lossless control.
+/// If lossless = false, uses -q:v 78 (typical 40-70% size reduction with visually indistinguishable quality).
 pub fn convert_to_webp(input: &Path, output: &Path, quality_lossless: bool) -> Result<(), String> {
-    let img = ImageReader::open(input)
-        .map_err(|e| format!("Failed to read image: {}", e))?
-        .with_guessed_format()
-        .map_err(|e| format!("Failed to determine format: {}", e))?
-        .decode()
-        .map_err(|e| format!("Failed to decode image: {}", e))?;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-i"]).arg(input);
 
-    let out_file = File::create(output).map_err(|e| format!("Failed to create output file: {}", e))?;
-    let mut writer = BufWriter::new(out_file);
-
-    // Save as webp or jpeg depending on option
     if quality_lossless {
-        img.write_to(&mut writer, image::ImageFormat::WebP)
-            .map_err(|e| format!("Failed to write WebP image: {}", e))?;
+        cmd.args(["-c:v", "libwebp", "-lossless", "1", "-compression_level", "6"]);
     } else {
-        // High efficiency lossy WebP or compressed JPEG fallback
-        img.write_to(&mut writer, image::ImageFormat::WebP)
-            .map_err(|e| format!("Failed to encode WebP: {}", e))?;
+        // High efficiency lossy WebP at quality 78 with photo preset
+        cmd.args([
+            "-c:v",
+            "libwebp",
+            "-lossless",
+            "0",
+            "-q:v",
+            "78",
+            "-preset",
+            "photo",
+            "-compression_level",
+            "4",
+        ]);
     }
 
-    Ok(())
+    cmd.arg(output);
+
+    let status = cmd
+        .status()
+        .map_err(|e| format!("Failed to execute ffmpeg for WebP: {}", e))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err("FFmpeg WebP encoding failed".to_string())
+    }
 }
 
 pub fn optimize_jpeg(input: &Path, output: &Path, max_dimension: u32) -> Result<(), String> {
@@ -49,7 +63,7 @@ pub fn optimize_jpeg(input: &Path, output: &Path, max_dimension: u32) -> Result<
     let out_file = File::create(output).map_err(|e| format!("Failed to create output file: {}", e))?;
     let mut writer = BufWriter::new(out_file);
 
-    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, 82);
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, 80);
     encoder
         .encode(
             rgb.as_raw(),
